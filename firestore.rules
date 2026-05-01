@@ -1,0 +1,72 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} { allow read, write: if false; }
+
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'createdAt']) && data.keys().size() <= 3
+        && data.email is string && data.email.size() <= 256
+        && data.createdAt == request.time
+        && data.get('displayName', '') is string && data.get('displayName', '').size() <= 200;
+    }
+
+    function isUpdateValidUser(data) {
+      return data.email is string && data.email.size() <= 256
+          && data.get('displayName', '') is string && data.get('displayName', '').size() <= 200;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidUser(incoming());
+      allow update: if isSignedIn() && request.auth.uid == userId && isUpdateValidUser(incoming()) && incoming().createdAt == existing().createdAt && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName'])
+      );
+    }
+
+    function isValidModule(data) {
+      return data.keys().hasAll(['userId', 'title', 'type', 'status', 'rawContent', 'hasFiles', 'createdAt', 'updatedAt']) 
+        && data.keys().size() <= 10
+        && data.userId is string && data.userId == request.auth.uid
+        && data.title is string && data.title.size() <= 500
+        && data.type is string && (data.type == 'guided' || data.type == 'quick' || data.type == 'quiz' || data.type == 'flashcards')
+        && data.status is string && (data.status == 'processing' || data.status == 'ready' || data.status == 'failed' || data.status == 'editing')
+        && data.rawContent is string && data.rawContent.size() <= 1000000
+        && data.hasFiles is bool
+        && data.createdAt == request.time
+        && data.updatedAt == request.time
+        && data.get('generatedData', {}) is map
+        && data.get('errorMessage', '') is string && data.get('errorMessage', '').size() <= 10000;
+    }
+
+    function isUpdateValidModule(data) {
+       return data.userId is string && data.userId == existing().userId
+        && data.title is string && data.title.size() <= 500
+        && data.type == existing().type
+        && data.status is string && (data.status == 'processing' || data.status == 'ready' || data.status == 'failed' || data.status == 'editing')
+        && data.rawContent is string && data.rawContent.size() <= 1000000
+        && data.hasFiles == existing().hasFiles
+        && data.updatedAt == request.time
+        && data.get('generatedData', {}) is map
+        && data.get('errorMessage', '') is string && data.get('errorMessage', '').size() <= 10000;
+    }
+
+    match /courses/{courseId} {
+      allow get, list: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow create: if request.auth != null && incoming().userId == request.auth.uid;
+      allow update: if request.auth != null && existing().userId == request.auth.uid;
+      allow delete: if request.auth != null && existing().userId == request.auth.uid;
+    }
+
+    match /courses/{courseId}/chapters/{chapterId} {
+      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow create, update, delete: if request.auth != null && incoming().userId == request.auth.uid;
+    }
+  }
+}
