@@ -1,22 +1,55 @@
 import { useEffect, useState } from 'react';
 import { useAuth } from '../lib/auth';
 import { db } from '../lib/firebase';
-import { collection, query, where, orderBy, onSnapshot } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, deleteDoc, updateDoc } from 'firebase/firestore';
 import { Link } from 'react-router';
-import { Plus, LayoutTemplate, Clock, AlertCircle } from 'lucide-react';
+import { LayoutTemplate, Trash2, MoreVertical, Loader2, Globe, Lock } from 'lucide-react';
+import { ModuleCard } from '../components/ModuleCard';
 
-interface Module {
+interface Course {
   id: string;
   title: string;
   status: 'draft_outline' | 'review_outline' | 'generating_chapters' | 'ready' | 'failed' | 'processing';
   errorMessage?: string;
   createdAt: any;
+  isPublic?: boolean;
+  authorName?: string;
+  coverImageUrl?: string;
 }
 
 export default function Library() {
   const { user } = useAuth();
-  const [modules, setModules] = useState<Module[]>([]);
+  const [courses, setCourses] = useState<Course[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = () => setMenuOpenId(null);
+    document.addEventListener('click', handleClickOutside);
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, []);
+
+  const handleDelete = async (courseId: string) => {
+    setMenuOpenId(null);
+    setDeletingId(courseId);
+    try {
+      await deleteDoc(doc(db, 'courses', courseId));
+    } catch (error: any) {
+      console.error('Failed to delete course:', error);
+      alert(`Failed to delete course: ${error.message}`);
+      setDeletingId(null);
+    }
+  };
+
+  const handleTogglePublic = async (course: Course) => {
+    setMenuOpenId(null);
+    try {
+      await updateDoc(doc(db, 'courses', course.id), { isPublic: !course.isPublic });
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   useEffect(() => {
     if (!user) return;
@@ -30,7 +63,7 @@ export default function Library() {
       const docs = snapshot.docs.map(doc => ({
         id: doc.id,
         ...doc.data()
-      })) as Module[];
+      })) as Course[];
       
       // Sort by creation time descending
       docs.sort((a, b) => {
@@ -39,7 +72,7 @@ export default function Library() {
         return timeB - timeA;
       });
 
-      setModules(docs);
+      setCourses(docs);
       setLoading(false);
     });
 
@@ -53,7 +86,7 @@ export default function Library() {
   return (
     <div className="flex flex-col h-full">
       <div className="p-8 flex-1 overflow-y-auto">
-        {modules.length === 0 ? (
+        {courses.length === 0 ? (
           <div className="text-center py-20 bg-white rounded-2xl border border-gray-100 shadow-sm">
             <LayoutTemplate className="mx-auto h-12 w-12 text-gray-300 mb-4" />
             <h3 className="text-lg font-medium text-gray-900">No courses yet</h3>
@@ -68,39 +101,83 @@ export default function Library() {
         ) : (
           <>
             <h2 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">Your Courses</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {modules.map((mod) => (
-                <div key={mod.id} className="bg-white p-5 rounded-xl border border-gray-200 hover:border-indigo-300 transition-all cursor-pointer group">
-                  <div className="flex justify-between items-start mb-4">
-                    <StatusBadge status={mod.status} />
-                    <span className="text-[10px] text-gray-400">
-                      Created {mod.createdAt ? new Date(mod.createdAt.toMillis()).toLocaleDateString() : 'Just now'}
-                    </span>
-                  </div>
-                  <h3 className="font-bold text-gray-900 mb-1 group-hover:text-indigo-600 truncate">{mod.title || 'Untitled Course'}</h3>
-                  <p className="text-xs text-gray-500 line-clamp-2 leading-relaxed">Interactive course generated from your content.</p>
-                  
-                  <div className="mt-4 flex items-center justify-between pt-4 border-t border-gray-50">
-                    <span className="text-[10px] text-gray-400">Interactive AI Course</span>
-                    {mod.status === 'ready' || mod.status === 'generating_chapters' ? (
-                      <Link to={`/book/${mod.id}`} className="text-xs font-bold text-indigo-600">Open Course →</Link>
-                    ) : mod.status === 'draft_outline' || mod.status === 'review_outline' ? (
-                      <Link to={`/create-course/${mod.id}`} className="text-xs font-bold text-indigo-600">Continue Outline →</Link>
-                    ) : (
-                      <div className="flex flex-col items-end group/error relative">
-                        <span className="text-xs font-bold text-gray-400 cursor-not-allowed">
-                          Failed
-                        </span>
-                        {mod.status === 'failed' && mod.errorMessage && (
-                           <div className="hidden group-hover/error:block absolute bottom-full mb-2 right-0 w-64 p-2 bg-gray-900 text-white text-xs rounded shadow-lg z-10 whitespace-normal text-left">
-                             {mod.errorMessage}
-                           </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+              {courses.map((course) => {
+                const isDeleting = deletingId === course.id;
+                const linkTo = course.status === 'ready' || course.status === 'generating_chapters' 
+                  ? `/book/${course.id}` 
+                  : course.status === 'draft_outline' || course.status === 'review_outline'
+                  ? `/create-course/${course.id}`
+                  : '#';
+
+                return (
+                  <ModuleCard
+                    key={course.id}
+                    id={course.id}
+                    title={course.title}
+                    topic={course.status === 'failed' ? course.errorMessage : 'Interactive AI Course'}
+                    authorName={course.authorName || (user?.displayName || user?.email?.split('@')[0]) || 'You'}
+                    coverImageUrl={course.coverImageUrl}
+                    linkTo={linkTo}
+                    isDeleting={isDeleting}
+                    statusSlot={
+                      <div className="flex items-center gap-2">
+                        <StatusBadge status={course.status} />
+                        {course.isPublic && (
+                          <span className="px-2 py-1 bg-[#1A1E27]/80 backdrop-blur-md text-white border border-white/10 text-[10px] font-bold uppercase rounded-md shadow-sm flex items-center gap-1">
+                            <Globe className="w-3 h-3" /> Public
+                          </span>
                         )}
                       </div>
-                    )}
-                  </div>
-                </div>
-              ))}
+                    }
+                    actionMenuSlot={
+                      <div className="relative">
+                        <button
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setMenuOpenId(menuOpenId === course.id ? null : course.id);
+                          }}
+                          className="p-1 -mr-1 text-white hover:text-gray-300 rounded transition-colors drop-shadow-md"
+                          disabled={isDeleting}
+                        >
+                          <MoreVertical className="h-5 w-5" />
+                        </button>
+
+                        {menuOpenId === course.id && (
+                          <>
+                            <div className="fixed inset-0 z-10" onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuOpenId(null); }} />
+                            <div className="absolute right-0 mt-1 w-36 bg-white border border-gray-100 rounded-lg shadow-lg overflow-hidden z-20">
+                              <button
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  handleTogglePublic(course);
+                                }}
+                                className="w-full text-left px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-50 flex items-center justify-between transition-colors border-b border-gray-100"
+                              >
+                                <span className="font-medium">{course.isPublic ? 'Make Private' : 'Make Public'}</span>
+                                {course.isPublic ? <Lock className="h-4 w-4" /> : <Globe className="h-4 w-4" />}
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  handleDelete(course.id);
+                                }}
+                                className="w-full text-left px-4 py-2.5 text-sm text-red-600 hover:bg-red-50 flex items-center justify-between transition-colors"
+                              >
+                                <span className="font-medium">Delete</span>
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    }
+                  />
+                );
+              })}
             </div>
           </>
         )}
@@ -110,6 +187,7 @@ export default function Library() {
 }
 
 function StatusBadge({ status }: { status: string }) {
+
   if (status === 'processing' || status === 'generating_chapters') {
     return <span className="px-2 py-1 bg-blue-50 text-blue-700 text-[10px] font-bold uppercase rounded border border-blue-100">Processing</span>;
   }

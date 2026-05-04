@@ -27,6 +27,10 @@
           "type": "string",
           "description": "ID of the user who owns this course"
         },
+        "authorName": {
+          "type": "string",
+          "description": "Name of the author"
+        },
         "title": {
           "type": "string"
         },
@@ -40,6 +44,10 @@
         "outline": {
           "type": "object",
           "description": "The table of contents (Parts and Chapters)"
+        },
+        "isPublic": {
+          "type": "boolean",
+          "description": "Whether this course is public or not"
         },
         "createdAt": {
           "type": "string",

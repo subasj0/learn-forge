@@ -58,15 +58,16 @@ service cloud.firestore {
     }
 
     match /courses/{courseId} {
-      allow get, list: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow get, list: if resource.data.get('isPublic', false) == true || (request.auth != null && resource.data.userId == request.auth.uid);
       allow create: if request.auth != null && incoming().userId == request.auth.uid;
       allow update: if request.auth != null && existing().userId == request.auth.uid;
       allow delete: if request.auth != null && existing().userId == request.auth.uid;
     }
 
     match /courses/{courseId}/chapters/{chapterId} {
-      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
-      allow create, update, delete: if request.auth != null && incoming().userId == request.auth.uid;
+      allow get, list: if get(/databases/$(database)/documents/courses/$(courseId)).data.get('isPublic', false) == true || (request.auth != null && get(/databases/$(database)/documents/courses/$(courseId)).data.userId == request.auth.uid);
+      allow create: if request.auth != null && incoming().userId == request.auth.uid;
+      allow update, delete: if request.auth != null && existing().userId == request.auth.uid;
     }
   }
 }

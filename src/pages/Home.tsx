@@ -1,11 +1,19 @@
 import React, { useState, FormEvent, useRef, useEffect } from 'react';
-import { useNavigate } from 'react-router';
+import { useNavigate, Link } from 'react-router';
 import localforage from 'localforage';
 import { useAuth } from '../lib/auth';
 import { db } from '../lib/firebase';
-import { collection, doc, setDoc, serverTimestamp } from 'firebase/firestore';
-import { generateLearningModule, FileData } from '../lib/generate';
-import { Plus, X, ArrowUp, Zap, BookOpen, Layers, CheckSquare, ChevronDown, FileText } from 'lucide-react';
+import { collection, doc, setDoc, serverTimestamp, query, where, onSnapshot, orderBy, limit } from 'firebase/firestore';
+import { Plus, X, ArrowUp, Zap, BookOpen, Layers, CheckSquare, ChevronDown, FileText, Globe, LayoutTemplate } from 'lucide-react';
+import { ModuleCard } from '../components/ModuleCard';
+import { CreatorBox } from '../components/CreatorBox';
+
+export interface FileData {
+  inlineData: {
+    data: string;
+    mimeType: string;
+  };
+}
 
 const MODULE_TYPES = [
   { id: 'guided', icon: BookOpen, title: 'Guided Lesson' },
@@ -14,8 +22,18 @@ const MODULE_TYPES = [
   { id: 'flashcards', icon: Layers, title: 'Flashcards' },
 ];
 
+interface PublicCourse {
+  id: string;
+  title: string;
+  topic?: string;
+  authorName?: string;
+  coverImageUrl?: string;
+  status: 'draft_outline' | 'review_outline' | 'generating_chapters' | 'ready' | 'failed' | 'processing';
+  createdAt: any;
+}
+
 export default function Home() {
-  const { user } = useAuth();
+  const { user, openLoginModal } = useAuth();
   const navigate = useNavigate();
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(false);
@@ -23,6 +41,9 @@ export default function Home() {
   const [moduleType, setModuleType] = useState('guided');
   const [showTypeMenu, setShowTypeMenu] = useState(false);
   
+  const [publicCourses, setPublicCourses] = useState<PublicCourse[]>([]);
+  const [loadingPublic, setLoadingPublic] = useState(true);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -52,6 +73,7 @@ export default function Home() {
 
           await setDoc(newCourseRef, {
             userId: user.uid,
+            authorName: user.displayName || user.email?.split('@')[0] || 'Anonymous',
             title: displayTitle,
             topic: savedContent || 'Generated Course',
             status: 'draft_outline',
@@ -70,6 +92,37 @@ export default function Home() {
     };
     checkPendingGeneration();
   }, [user, navigate]);
+
+  useEffect(() => {
+    // Fetch public courses
+    const q = query(
+      collection(db, 'courses'),
+      where('isPublic', '==', true),
+      limit(20)
+    );
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const courses = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as PublicCourse[];
+      
+      // Sort by createdAt desc locally to avoid needing composite index just for this
+      courses.sort((a, b) => {
+        const timeA = a.createdAt?.toMillis?.() || 0;
+        const timeB = b.createdAt?.toMillis?.() || 0;
+        return timeB - timeA;
+      });
+      
+      setPublicCourses(courses);
+      setLoadingPublic(false);
+    }, (error) => {
+      console.error("Error fetching public courses:", error);
+      setLoadingPublic(false);
+    });
+    
+    return () => unsubscribe();
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = e.target.files;
@@ -120,7 +173,7 @@ export default function Home() {
           fileDataList,
           moduleType
         }));
-        navigate('/login');
+        openLoginModal();
       } catch (error) {
         console.error("Error preparing files", error);
         alert("Failed to prepare files for login. Please try again.");
@@ -142,6 +195,7 @@ export default function Home() {
 
       await setDoc(newCourseRef, {
         userId: user.uid,
+        authorName: user.displayName || user.email?.split('@')[0] || 'Anonymous',
         title: displayTitle,
         topic: content,
         status: 'draft_outline',
@@ -176,8 +230,8 @@ export default function Home() {
   const ActiveIcon = activeType.icon;
 
   return (
-    <div className="flex flex-col h-full items-center pt-[15vh] px-4 w-full max-w-4xl mx-auto">
-      <h1 className="text-4xl md:text-5xl font-medium text-gray-900 mb-8 tracking-tight">
+    <div className="flex flex-col h-full items-center pt-[15vh] px-4 w-full max-w-7xl mx-auto">
+      <h1 className="text-3xl md:text-4xl font-medium text-gray-700 mb-8 tracking-tight">
         Welcome to LearnForge.
       </h1>
 
@@ -202,101 +256,58 @@ export default function Home() {
         </button>
       </div>
 
-      <div className="w-full max-w-3xl bg-gray-50 border border-gray-200 rounded-3xl p-3 shadow-sm transition-all focus-within:ring-2 focus-within:ring-gray-200 focus-within:bg-white relative">
-        {files.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-3 px-2">
-            {files.map((file, index) => (
-              <div key={index} className="flex items-center gap-2 px-3 py-1.5 bg-white border border-gray-200 rounded-xl max-w-xs shadow-sm">
-                <FileText className="h-4 w-4 text-indigo-500 shrink-0" />
-                <span className="text-xs text-gray-700 truncate font-medium">{file.name}</span>
-                <button
-                  type="button"
-                  onClick={() => removeFile(index)}
-                  className="p-0.5 hover:bg-gray-100 rounded-full text-gray-400 hover:text-gray-600 transition-colors shrink-0"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </div>
+      <div className="w-full max-w-3xl relative">
+        <CreatorBox
+          content={content}
+          setContent={setContent}
+          files={files}
+          setFiles={setFiles}
+          moduleType={moduleType}
+          setModuleType={setModuleType}
+          onSubmit={handleSubmit}
+          disabled={loading || (!content.trim() && files.length === 0)}
+        />
+      </div>
+      {loading && <p className="text-sm text-gray-400 mt-4 animate-pulse">Processing your request...</p>}
+
+      {/* Explore Section */}
+      <div className="w-full mt-16 pb-16">
+        <div className="flex items-center gap-2 mb-6">
+          <Globe className="w-5 h-5 text-indigo-500" />
+          <h2 className="text-xl font-bold text-gray-900">Explore Public Courses</h2>
+        </div>
+
+        {loadingPublic ? (
+          <div className="flex justify-center p-8">
+            <div className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+          </div>
+        ) : publicCourses.length === 0 ? (
+          <div className="text-center py-12 bg-white rounded-3xl border border-gray-100 shadow-sm border-dashed">
+            <LayoutTemplate className="w-8 h-8 text-gray-300 mx-auto mb-3" />
+            <h3 className="text-sm font-medium text-gray-900">No public courses yet</h3>
+            <p className="text-sm text-gray-500 mt-1">Be the first to create and share a course.</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            {publicCourses.map(course => (
+              <ModuleCard
+                key={course.id}
+                id={course.id}
+                title={course.title}
+                topic={course.topic}
+                authorName={course.authorName}
+                coverImageUrl={course.coverImageUrl}
+                linkTo={`/book/${course.id}`}
+                statusSlot={
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 bg-[#1A1E27]/80 backdrop-blur-md text-white border border-white/10 text-[10px] font-bold uppercase rounded-md shadow-sm">
+                    <LayoutTemplate className="w-3 h-3" /> Course
+                  </div>
+                }
+              />
             ))}
           </div>
         )}
-
-        <textarea
-          ref={textareaRef}
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="What do you want to learn today?"
-          className="w-full bg-transparent border-none focus:ring-0 resize-none text-gray-800 text-base placeholder-gray-400 px-3 py-2 min-h-[80px]"
-          style={{ maxHeight: '400px' }}
-        />
-
-        <div className="flex items-center justify-between mt-2 pt-2">
-          <div className="flex items-center gap-2 relative">
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded-full transition-colors"
-              title="Attach files"
-            >
-              <Plus className="h-5 w-5" />
-            </button>
-            <input
-              type="file"
-              multiple
-              ref={fileInputRef}
-              onChange={handleFileChange}
-              className="hidden"
-              accept="application/pdf,text/plain,image/*"
-            />
-
-            <div className="relative">
-              <button
-                onClick={() => setShowTypeMenu(!showTypeMenu)}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 rounded-full text-sm font-medium shadow-sm transition-colors"
-              >
-                <ActiveIcon className="h-3.5 w-3.5 text-gray-500" />
-                {activeType.title}
-                <ChevronDown className="h-3.5 w-3.5 text-gray-400" />
-              </button>
-
-              {showTypeMenu && (
-                <>
-                  <div className="fixed inset-0 z-10" onClick={() => setShowTypeMenu(false)} />
-                  <div className="absolute top-full left-0 mt-2 w-48 bg-white border border-gray-100 rounded-xl shadow-lg z-20 py-2 overflow-hidden animate-in fade-in slide-in-from-top-2">
-                    {MODULE_TYPES.map(type => {
-                      const Icon = type.icon;
-                      return (
-                        <button
-                          key={type.id}
-                          onClick={() => {
-                            setModuleType(type.id);
-                            setShowTypeMenu(false);
-                          }}
-                          className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 hover:bg-gray-50 transition-colors
-                            ${type.id === moduleType ? 'text-gray-900 bg-gray-50 font-medium' : 'text-gray-600'}
-                          `}
-                        >
-                          <Icon className={`h-4 w-4 ${type.id === moduleType ? 'text-gray-900' : 'text-gray-400'}`} />
-                          {type.title}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-
-          <button
-            onClick={() => handleSubmit()}
-            disabled={loading || (!content.trim() && files.length === 0)}
-            className="p-2 bg-black text-white rounded-full hover:bg-gray-800 disabled:bg-gray-300 disabled:text-gray-500 transition-colors shadow-sm"
-          >
-            <ArrowUp className="h-5 w-5" />
-          </button>
-        </div>
       </div>
-      {loading && <p className="text-sm text-gray-400 mt-4 animate-pulse">Processing your request...</p>}
     </div>
   );
 }
