@@ -4,12 +4,13 @@ import { Zap, ArrowUp, Plus, FileText, X, ChevronDown, Globe, LayoutTemplate, Lo
 import { motion, AnimatePresence } from 'motion/react';
 import { collection, query, where, limit, onSnapshot } from 'firebase/firestore';
 import { db } from '../lib/firebase';
+import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 import { ModuleCard } from '../components/ModuleCard';
-import { CreatorBox } from '../components/CreatorBox';
+import { CreatorBox, ExtractedFile } from '../components/CreatorBox';
 
 const MODULE_TYPES = [
   { id: 'guided', title: 'Guided Lesson' },
-  { id: 'quick', title: 'Quick Review' },
+  { id: 'quick', title: 'Explore New Topic' },
   { id: 'quiz', title: 'Quiz' },
   { id: 'flashcards', title: 'Flashcards' },
 ];
@@ -17,7 +18,7 @@ const MODULE_TYPES = [
 export default function Landing() {
   const { openLoginModal } = useAuth();
   const [content, setContent] = useState('');
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<ExtractedFile[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [moduleType, setModuleType] = useState('guided');
@@ -56,40 +57,19 @@ export default function Landing() {
       });
       setPublicCourses(courses);
       setLoadingPublic(false);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'courses/public');
+      setLoadingPublic(false);
     });
     
     return () => unsubscribe();
   }, []);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.length) {
-      setFiles(prev => [...prev, ...Array.from(e.target.files!)]);
-    }
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const readFilesAsBase64 = async (files: File[]) => {
-    return Promise.all(
-      files.map(file => new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve({
-          inlineData: {
-            data: (reader.result as string).split(',')[1],
-            mimeType: file.type || 'application/octet-stream'
-          }
-        });
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      }))
-    );
-  };
-
   const handleStart = async () => {
     if (!content.trim() && files.length === 0) return;
     
-    // Read files first, save to local storage, then open login modal
     try {
-      const fileDataList = await readFilesAsBase64(files);
+      const fileDataList = files.filter(f => f.status === 'done').map(f => ({ text: f.text, name: f.name }));
       localStorage.setItem('pendingModuleGeneration', JSON.stringify({
         content,
         fileDataList,

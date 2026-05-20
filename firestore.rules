@@ -8,7 +8,17 @@ service cloud.firestore {
     }
     function incoming() { return request.resource.data; }
     function existing() { return resource.data; }
-    function isSignedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+    function isSignedIn() { 
+      return request.auth != null; 
+    }
+
+    function isOwner(data) {
+      return isSignedIn() && data.userId == request.auth.uid;
+    }
+
+    function isPublic(data) {
+      return data.get('isPublic', false) == true;
+    }
 
     function isValidUser(data) {
       return data.keys().hasAll(['email', 'createdAt']) && data.keys().size() <= 3
@@ -29,45 +39,34 @@ service cloud.firestore {
         incoming().diff(existing()).affectedKeys().hasOnly(['displayName'])
       );
     }
-
-    function isValidModule(data) {
-      return data.keys().hasAll(['userId', 'title', 'type', 'status', 'rawContent', 'hasFiles', 'createdAt', 'updatedAt']) 
-        && data.keys().size() <= 10
-        && data.userId is string && data.userId == request.auth.uid
-        && data.title is string && data.title.size() <= 500
-        && data.type is string && (data.type == 'guided' || data.type == 'quick' || data.type == 'quiz' || data.type == 'flashcards')
-        && data.status is string && (data.status == 'processing' || data.status == 'ready' || data.status == 'failed' || data.status == 'editing')
-        && data.rawContent is string && data.rawContent.size() <= 1000000
-        && data.hasFiles is bool
-        && data.createdAt == request.time
-        && data.updatedAt == request.time
-        && data.get('generatedData', {}) is map
-        && data.get('errorMessage', '') is string && data.get('errorMessage', '').size() <= 10000;
-    }
-
-    function isUpdateValidModule(data) {
-       return data.userId is string && data.userId == existing().userId
-        && data.title is string && data.title.size() <= 500
-        && data.type == existing().type
-        && data.status is string && (data.status == 'processing' || data.status == 'ready' || data.status == 'failed' || data.status == 'editing')
-        && data.rawContent is string && data.rawContent.size() <= 1000000
-        && data.hasFiles == existing().hasFiles
-        && data.updatedAt == request.time
-        && data.get('generatedData', {}) is map
-        && data.get('errorMessage', '') is string && data.get('errorMessage', '').size() <= 10000;
+    
+    match /users/{userId}/billing/usage {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow create, update: if isSignedIn() && request.auth.uid == userId;
     }
 
     match /courses/{courseId} {
-      allow get, list: if resource.data.get('isPublic', false) == true || (request.auth != null && resource.data.userId == request.auth.uid);
-      allow create: if request.auth != null && incoming().userId == request.auth.uid;
-      allow update: if request.auth != null && existing().userId == request.auth.uid;
-      allow delete: if request.auth != null && existing().userId == request.auth.uid;
+      allow get, list: if isPublic(resource.data) || isOwner(resource.data);
+      allow create: if isOwner(incoming());
+      allow update: if isOwner(existing());
+      allow delete: if isOwner(existing());
+
+      match /chapters/{chapterId} {
+        allow get, list: if isPublic(get(/databases/$(database)/documents/courses/$(courseId)).data) || isOwner(get(/databases/$(database)/documents/courses/$(courseId)).data);
+        allow create: if isOwner(incoming());
+        allow update, delete: if isOwner(existing());
+      }
     }
 
-    match /courses/{courseId}/chapters/{chapterId} {
-      allow get, list: if get(/databases/$(database)/documents/courses/$(courseId)).data.get('isPublic', false) == true || (request.auth != null && get(/databases/$(database)/documents/courses/$(courseId)).data.userId == request.auth.uid);
-      allow create: if request.auth != null && incoming().userId == request.auth.uid;
-      allow update, delete: if request.auth != null && existing().userId == request.auth.uid;
+    match /chatSessions/{sessionId} {
+      allow read: if isOwner(resource.data);
+      allow create: if isOwner(incoming());
+      allow update: if isOwner(existing());
+      allow delete: if isOwner(existing());
+      
+      match /messages/{messageId} {
+        allow read, write: if isSignedIn() && get(/databases/$(database)/documents/chatSessions/$(sessionId)).data.userId == request.auth.uid;
+      }
     }
   }
 }

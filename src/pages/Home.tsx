@@ -4,20 +4,21 @@ import localforage from 'localforage';
 import { useAuth } from '../lib/auth';
 import { db } from '../lib/firebase';
 import { collection, doc, setDoc, serverTimestamp, query, where, onSnapshot, orderBy, limit } from 'firebase/firestore';
-import { Plus, X, ArrowUp, Zap, BookOpen, Layers, CheckSquare, ChevronDown, FileText, Globe, LayoutTemplate } from 'lucide-react';
+import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { Plus, X, ArrowUp, Zap, BookOpen, Layers, CheckSquare, ChevronDown, FileText, Globe, LayoutTemplate, Sparkles } from 'lucide-react';
+import { motion } from 'motion/react';
 import { ModuleCard } from '../components/ModuleCard';
-import { CreatorBox } from '../components/CreatorBox';
+import { CreatorBox, ExtractedFile } from '../components/CreatorBox';
 
 export interface FileData {
-  inlineData: {
-    data: string;
-    mimeType: string;
-  };
+  text?: string;
+  name: string;
 }
 
 const MODULE_TYPES = [
   { id: 'guided', icon: BookOpen, title: 'Guided Lesson' },
-  { id: 'quick', icon: Zap, title: 'Quick Review' },
+  { id: 'interactive', icon: Sparkles, title: 'Interactive Module' },
+  { id: 'quick', icon: Zap, title: 'Explore New Topic' },
   { id: 'quiz', icon: CheckSquare, title: 'Quiz' },
   { id: 'flashcards', icon: Layers, title: 'Flashcards' },
 ];
@@ -37,7 +38,7 @@ export default function Home() {
   const navigate = useNavigate();
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(false);
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<ExtractedFile[]>([]);
   const [moduleType, setModuleType] = useState('guided');
   const [showTypeMenu, setShowTypeMenu] = useState(false);
   
@@ -71,11 +72,14 @@ export default function Home() {
           const newCourseRef = doc(coursesRef);
           const courseId = newCourseRef.id;
 
+          const personalization = JSON.parse(localStorage.getItem('currentPersonalization') || '{}');
           await setDoc(newCourseRef, {
             userId: user.uid,
             authorName: user.displayName || user.email?.split('@')[0] || 'Anonymous',
             title: displayTitle,
             topic: savedContent || 'Generated Course',
+            moduleType: savedModuleType || 'guided',
+            personalization: personalization,
             status: 'draft_outline',
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp()
@@ -117,48 +121,12 @@ export default function Home() {
       setPublicCourses(courses);
       setLoadingPublic(false);
     }, (error) => {
-      console.error("Error fetching public courses:", error);
+      handleFirestoreError(error, OperationType.LIST, 'courses/public');
       setLoadingPublic(false);
     });
     
     return () => unsubscribe();
   }, []);
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = e.target.files;
-    if (selectedFiles && selectedFiles.length > 0) {
-      const filesArray = Array.from(selectedFiles);
-      setFiles(prev => [...prev, ...filesArray]);
-    }
-    setTimeout(() => {
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }, 0);
-  };
-
-  const removeFile = (index: number) => {
-    setFiles(prev => prev.filter((_, i) => i !== index));
-  };
-
-  const readFilesAsBase64 = async (files: File[]): Promise<FileData[]> => {
-    const promises = files.map(file => {
-      return new Promise<FileData>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const result = reader.result as string;
-          const base64Data = result.split(',')[1];
-          resolve({
-            inlineData: {
-              data: base64Data,
-              mimeType: file.type || 'application/octet-stream',
-            }
-          });
-        };
-        reader.onerror = error => reject(error);
-        reader.readAsDataURL(file);
-      });
-    });
-    return Promise.all(promises);
-  };
 
   const handleSubmit = async (e?: FormEvent) => {
     if (e) e.preventDefault();
@@ -167,7 +135,7 @@ export default function Home() {
     if (!user) {
       setLoading(true);
       try {
-        const fileDataList = await readFilesAsBase64(files);
+        const fileDataList = files.filter(f => f.status === 'done').map(f => ({ text: f.text, name: f.name }));
         localStorage.setItem('pendingModuleGeneration', JSON.stringify({
           content,
           fileDataList,
@@ -186,18 +154,21 @@ export default function Home() {
     setLoading(true);
     
     try {
-      const fileDataList = await readFilesAsBase64(files);
+      const fileDataList = files.filter(f => f.status === 'done').map(f => ({ text: f.text, name: f.name }));
       const displayTitle = 'Generating course...';
       
       const coursesRef = collection(db, 'courses');
       const newCourseRef = doc(coursesRef);
       const courseId = newCourseRef.id;
 
+      const personalization = JSON.parse(localStorage.getItem('currentPersonalization') || '{}');
       await setDoc(newCourseRef, {
         userId: user.uid,
         authorName: user.displayName || user.email?.split('@')[0] || 'Anonymous',
         title: displayTitle,
         topic: content,
+        moduleType: moduleType,
+        personalization: personalization,
         status: 'draft_outline',
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp()
@@ -230,33 +201,24 @@ export default function Home() {
   const ActiveIcon = activeType.icon;
 
   return (
-    <div className="flex flex-col h-full items-center pt-[15vh] px-4 w-full max-w-7xl mx-auto">
-      <h1 className="text-3xl md:text-4xl font-medium text-gray-700 mb-8 tracking-tight">
+    <div className="flex flex-col min-h-full items-center py-12 md:py-24 px-4 w-full max-w-7xl mx-auto overflow-x-hidden relative">
+      <div className="absolute top-0 left-0 w-full h-[500px] bg-gradient-to-b from-indigo-50/30 to-transparent pointer-events-none" />
+      
+      <motion.h1 
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
+        className="text-3xl md:text-5xl font-medium tracking-tight text-center text-gray-700 mb-10"
+      >
         Welcome to LearnForge.
-      </h1>
+      </motion.h1>
 
-      <div className="flex flex-wrap items-center justify-center gap-3 mb-8">
-        <button 
-          onClick={() => handleTemplateClick("I want to learn about the history of Ancient Rome...", "guided")}
-          className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full text-sm font-medium transition-colors border border-transparent shadow-sm"
-        >
-          A guided lesson about Ancient Rome...
-        </button>
-        <button 
-          onClick={() => handleTemplateClick("Let's review the principles of React Hooks...", "quick")}
-          className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full text-sm font-medium transition-colors border border-transparent shadow-sm"
-        >
-          A quick review of React Hooks...
-        </button>
-        <button 
-          onClick={() => handleTemplateClick("Test me on intermediate Spanish vocabulary...", "quiz")}
-          className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full text-sm font-medium transition-colors border border-transparent shadow-sm"
-        >
-          A quiz on Spanish vocabulary...
-        </button>
-      </div>
-
-      <div className="w-full max-w-3xl relative">
+      <motion.div 
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6, delay: 0.1, ease: [0.16, 1, 0.3, 1] }}
+        className="w-full max-w-3xl relative"
+      >
         <CreatorBox
           content={content}
           setContent={setContent}
@@ -267,8 +229,38 @@ export default function Home() {
           onSubmit={handleSubmit}
           disabled={loading || (!content.trim() && files.length === 0)}
         />
-      </div>
-      {loading && <p className="text-sm text-gray-400 mt-4 animate-pulse">Processing your request...</p>}
+        
+        <div className="flex flex-wrap items-center justify-center gap-2 mt-6">
+          <button 
+            onClick={() => handleTemplateClick("I want to learn about the history of Ancient Rome...", "guided")}
+            className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-600 hover:text-gray-900 rounded-full text-sm font-medium transition-colors border border-gray-200 shadow-sm"
+          >
+            Ancient Rome History
+          </button>
+          <button 
+            onClick={() => handleTemplateClick("Let's explore a new topic like Quantum Physics...", "quick")}
+            className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-600 hover:text-gray-900 rounded-full text-sm font-medium transition-colors border border-gray-200 shadow-sm"
+          >
+            Quantum Physics
+          </button>
+          <button 
+            onClick={() => handleTemplateClick("Test me on intermediate Spanish vocabulary...", "quiz")}
+            className="px-4 py-2 bg-white hover:bg-gray-50 text-gray-600 hover:text-gray-900 rounded-full text-sm font-medium transition-colors border border-gray-200 shadow-sm"
+          >
+            Spanish Vocab Quiz
+          </button>
+        </div>
+      </motion.div>
+
+      {loading && (
+        <motion.p 
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="text-sm text-gray-400 mt-6 animate-pulse"
+        >
+          Processing your request...
+        </motion.p>
+      )}
 
       {/* Explore Section */}
       <div className="w-full mt-16 pb-16">

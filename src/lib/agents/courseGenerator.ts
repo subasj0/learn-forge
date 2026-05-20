@@ -1,7 +1,9 @@
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-import { db } from '../firebase';
+import { db, auth } from '../firebase';
 import { doc, updateDoc, setDoc, serverTimestamp, collection } from 'firebase/firestore';
 import { jsonrepair } from 'jsonrepair';
+import { checkBudget, recordUsage, BudgetExceededError } from './usageTracker';
+import { uploadContent, uploadBinary } from '../storage';
 
 const ai = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY }); // fallback
 
@@ -50,30 +52,59 @@ const outlineSchema: Schema = {
   required: ["title", "parts"]
 };
 
-export async function generateCourseOutline(courseId: string, topic: string, files?: any[]) {
+export async function generateCourseOutline(courseId: string, topic: string, files?: {name: string, text: string}[], moduleType?: string, personalization?: any) {
   try {
+    const userId = auth.currentUser?.uid;
+    if (userId) {
+      await checkBudget(userId);
+    }
+    
+    let styleGuide = '';
+    if (personalization) {
+      styleGuide += `\nTarget Audience Complexity: ${personalization.complexity}`;
+      if (personalization.intent) styleGuide += `\nLearning Goal: ${personalization.intent}`;
+      if (personalization.interests) styleGuide += `\nEngage the user by connecting topics to these interests: ${personalization.interests}`;
+    }
+
+    const typeGuidance = moduleType === 'quick' ? 'Focus purely on exploring this new topic efficiently. Do not include heavy quiz sections, keep it exploratory and fast-paced.' 
+      : moduleType === 'quiz' ? 'The primary focus is testing the user. Ensure the outline relies heavily on quizzes and knowledge checks.'
+      : moduleType === 'flashcards' ? 'The primary focus is memorization. Keep the content bite-sized and perfect for flashcards.'
+      : 'This is a guided lesson. Include a well-rounded mix of theory, practical examples, and interactive quizzes/exercises at the end of sections.';
+
     const textPrompt = `You are an expert curriculum designer.
 Generate a comprehensive course outline.
 ${topic ? `Topic to guide the outline: "${topic}"` : 'Use the attached files to determine the topic and content of the course.'}
+${styleGuide}
+Course Type Guidance: ${typeGuidance}
+
 If you are provided with attached documents/files, make sure the outline heavily reflects and covers the content of those files.
 Structure the course into logical Parts, and within each Part, create several Chapters.
-For each chapter, provide a detailed 'guidance' string that outlines exactly what the chapter should cover, key concepts, and any specific exercises or analogies to include. This guidance will be used by another AI to write the actual chapter content.
+For each chapter, provide a detailed 'guidance' string that outlines exactly what the chapter should cover, key concepts, and any specific exercises or analogies to include based on the Course Type Guidance and style guide. This guidance will be used by another AI to write the actual chapter content.
 Do not make it too long; a total of 2-3 Parts and 3-4 Chapters per part is ideal.
 Return ONLY valid JSON data according to the schema.`;
 
     const parts: any[] = [{ text: textPrompt }];
     if (files && files.length > 0) {
-      parts.push(...files);
+      files.forEach((f) => {
+        if (f.text) {
+          parts.push({ text: `\n--- File: ${f.name} ---\n${f.text}\n--- End of File ---\n` });
+        }
+      });
     }
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-3-flash-preview",
       contents: { parts },
       config: {
         responseMimeType: "application/json",
-        responseSchema: outlineSchema
+        responseSchema: outlineSchema,
+        maxOutputTokens: 10000
       }
     });
+
+    if (userId && response.usageMetadata) {
+      await recordUsage(userId, 'gemini-3-flash-preview', response.usageMetadata.promptTokenCount, response.usageMetadata.candidatesTokenCount);
+    }
 
     let jsonText = response.text || "{}";
     const match = jsonText.match(/\{[\s\S]*\}/);
@@ -112,6 +143,32 @@ Return ONLY valid JSON data according to the schema.`;
       updatedAt: serverTimestamp()
     });
 
+    // Helper to resize base64 images to stay within Firestore limits
+    const resizeBase64Image = (base64Str: string, maxWidth = 800): Promise<string> => {
+      return new Promise((resolve) => {
+        if (typeof window === 'undefined') {
+          resolve(base64Str);
+          return;
+        }
+        const img = new window.Image();
+        img.src = base64Str;
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          const scale = maxWidth / img.width;
+          if (scale >= 1) {
+            resolve(base64Str);
+            return;
+          }
+          canvas.width = maxWidth;
+          canvas.height = img.height * scale;
+          const ctx = canvas.getContext("2d");
+          ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/jpeg", 0.6)); // compressed jpeg
+        };
+        img.onerror = () => resolve(base64Str);
+      });
+    };
+
     // Background Image Generation task
     (async () => {
       try {
@@ -119,7 +176,7 @@ Return ONLY valid JSON data according to the schema.`;
           const imageResp = await ai.models.generateContent({
             model: 'gemini-2.5-flash-image',
             contents: {
-              parts: [{ text: `A beautiful, cinematic, and professional cover photo for an educational course titled "${outlineData.title}". ${topic ? `Theme: ${topic}` : ''}. High quality, elegant styling, 4k resolution, no text or words in the image.` }]
+              parts: [{ text: `A beautiful, cinematic, and professional cover photo for an educational course titled "${outlineData.title}". ${topic ? `Theme: ${topic}` : ''}. High quality, elegant styling, no text or words in the image.` }]
             },
             config: {
               imageConfig: { aspectRatio: '16:9' }
@@ -127,11 +184,29 @@ Return ONLY valid JSON data according to the schema.`;
           });
           
           if (imageResp.candidates?.[0]?.content?.parts) {
+            if (userId) {
+              await recordUsage(userId, 'gemini-2.5-flash-image', 0, 1, true);
+            }
             for (const part of imageResp.candidates[0].content.parts) {
               if (part.inlineData) {
                 const mimeType = part.inlineData.mimeType || 'image/jpeg';
-                const coverImageUrl = `data:${mimeType};base64,${part.inlineData.data}`;
-                await updateDoc(courseRef, { coverImageUrl });
+                const rawBase64 = `data:${mimeType};base64,${part.inlineData.data}`;
+                const resizedImage = await resizeBase64Image(rawBase64, 1024);
+                
+                // Convert base64 to Blob for storage
+                const base64Data = resizedImage.split(',')[1];
+                const byteCharacters = atob(base64Data);
+                const byteNumbers = new Array(byteCharacters.length);
+                for (let i = 0; i < byteCharacters.length; i++) {
+                  byteNumbers[i] = byteCharacters.charCodeAt(i);
+                }
+                const byteArray = new Uint8Array(byteNumbers);
+                const blob = new Blob([byteArray], { type: 'image/jpeg' });
+                
+                const storagePath = `courses/${courseId}/cover.jpg`;
+                const storageUrl = await uploadBinary(storagePath, blob, 'image/jpeg');
+                
+                await updateDoc(courseRef, { coverImageUrl: storageUrl });
                 break;
               }
             }
@@ -161,128 +236,170 @@ const chapterSchema: Schema = {
   properties: {
     mainContent: {
       type: Type.ARRAY,
-      description: "An array of content blocks that make up the chapter. The sequence of these blocks defines the reading flow. Avoid repetitive sequences.",
+      description: "A sequential list of content blocks that form the chapter. A healthy variety of block types prevents repetitive walls of text.",
       items: {
         type: Type.OBJECT,
         properties: {
           type: { 
             type: Type.STRING, 
-            description: "The type of content block. MUST be one of: 'heading', 'text', 'image_placeholder', 'callout', 'quiz', 'flashcard', 'try_it'." 
+            description: "MUST be one of: 'heading', 'subheading', 'text', 'image_placeholder', 'callout', 'try_it'." 
           },
           content: { 
             type: Type.STRING, 
-            description: "Used for: 'text' (markdown format), 'image_placeholder' (describe the image to be generated), 'flashcard' (the front/question text), 'try_it' (the task instructions), 'callout' (the message body). For other types, this may be left empty." 
+            description: "The main body of the block. For 'text' use markdown format. For 'image_placeholder' describe the visual. For 'try_it' provide the exercise instructions. For 'callout' provide the notice message." 
           },
           title: { 
             type: Type.STRING, 
-            description: "Used for: 'try_it' (exercise title) or 'quiz' (optional context title)." 
+            description: "Used ONLY when type is 'try_it' as the title of the exercise." 
           },
           calloutType: { 
             type: Type.STRING, 
-            description: "Used ONLY when type is 'callout'. Choose a label like 'Tip', 'Note', 'Warning', 'Think About It', etc." 
-          },
-          question: { 
-            type: Type.STRING, 
-            description: "Used ONLY when type is 'quiz'. The question being asked." 
-          },
-          options: { 
-            type: Type.ARRAY, 
-            items: { type: Type.STRING }, 
-            description: "Used ONLY when type is 'quiz'. An array of string answer options (e.g. 3-4 strings). MUST be an array of plain strings, not objects." 
-          },
-          correctOptionIndex: { 
-            type: Type.INTEGER, 
-            description: "Used ONLY when type is 'quiz'. The integer index (0-based) of the correct answer in the 'options' array." 
-          },
-          explanation: { 
-            type: Type.STRING, 
-            description: "Used ONLY when type is 'quiz'. Explains why the correct answer is right." 
-          },
-          backContent: { 
-            type: Type.STRING, 
-            description: "Used ONLY when type is 'flashcard'. The back/answer text of the flashcard." 
+            description: "Used ONLY when type is 'callout'. A short label like 'Tip', 'Note', 'Warning', or 'Did You Know'." 
           }
         },
-        required: ["type"]
+        required: ["type", "content"]
       }
     }
   },
   required: ["mainContent"]
 };
 
-export async function generateChapterContent(courseId: string, chapterInfo: { id: string; title: string; partTitle: string; guidance?: string }, courseContextInfo: string, orderIndex: number, userId: string, files?: any[]) {
+export async function generateChapterContent(courseId: string, chapterInfo: { id: string; title: string; partTitle: string; guidance?: string }, courseContextInfo: string, orderIndex: number, userId: string, files?: {name: string, text: string}[], moduleType?: string, personalization?: any, onProgress?: (partial: any) => void) {
 
   try {
-    const textPrompt = `You are a world-class course creator crafting an interactive chapter for an online course.
-You must construct the chapter by organizing various sequential content blocks.
-To combat repetitive text loops, use a diverse mix of 'types'. Do not output long walls of text. Be highly engaging and concise.
+    if (userId) {
+      await checkBudget(userId);
+    }
+    let styleGuide = '';
+    if (personalization) {
+      styleGuide += `\n- Target Audience Complexity: ${personalization.depth === 'introductory' ? 'Beginner' : personalization.depth === 'advanced' ? 'Advanced' : personalization.complexity || 'Intermediate'}`;
+      styleGuide += `\n- Tone: ${personalization.tone || 'Balanced'}`;
+      styleGuide += `\n- Interactivity Level: ${personalization.interactivity === 'high' ? 'High (include extra exercises and callouts)' : personalization.interactivity === 'minimal' ? 'Minimal (focus primarily on reading)' : 'Medium'}`;
+      if (personalization.intent) styleGuide += `\n- Learning Goal: ${personalization.intent}`;
+      if (personalization.focus) styleGuide += `\n- Specific Focus Area: ${personalization.focus}`;
+      if (personalization.customGuidance) styleGuide += `\n- Custom Guidance: ${personalization.customGuidance}`;
+      if (personalization.interests) styleGuide += `\n- Contextualize examples around these interests: ${personalization.interests}`;
+    }
 
-Course overall context: ${courseContextInfo}
-Current Part: ${chapterInfo.partTitle}
-Current Chapter: ${chapterInfo.title}
-${chapterInfo.guidance ? `\nChapter Guidance / Instructions:\n${chapterInfo.guidance}\n` : ''}
+    const typeGuidance = moduleType === 'quick' ? 'Keep it highly concise and fast-paced.'
+      : moduleType === 'quiz' ? 'Heavily emphasize interactive knowledge checks and reflection questions using the "try_it" block.'
+      : moduleType === 'flashcards' ? 'Deliver information in bite-sized, independent concepts perfect for memorization.'
+      : 'Provide a balanced mix of educational theory, practical examples, and short exercises.';
 
-Available Block Types & How to Use Them:
-1. 'heading': Use to structure the document into sections. (content: text to display)
-2. 'text': Use for paragraphs of main content. Provide standard markdown formatting. Limit paragraph length. (content: markdown)
-3. 'image_placeholder': Describe a visual concept heavily detailed so an image generator can create it. (content: description)
-4. 'callout': Draw attention to a specific point. (calloutType: e.g. 'Tip' or 'Warning', content: the message)
-5. 'quiz': A multiple choice question to test understanding. MUST match this exact format: {"type":"quiz","question":"...","options":["Option 1","Option 2","Option 3"],"correctOptionIndex":0,"explanation":"..."}
-6. 'flashcard': Introduce a concept on front, explain on back. (content: front text, backContent: back text)
-7. 'try_it': A practical exercise for the user. (title: exercise name, content: task instructions)
+    const textPrompt = `You are an expert educational course designer crafting a chapter for a digital learning platform.
+Your task is to generate the chapter using a sequence of layout blocks to create an engaging reading experience.
 
-Guidelines:
-- Start with a 'heading' block.
-- Provide the core educational content using 'text' blocks.
-- Break up text using 'callout', 'image_placeholder', and 'flashcard'.
-- Use 'try_it' to make the user practice.
-- Embed 'quiz' questions to validate knowledge.
-- If you are provided with attached documents/files, make sure you extract the relevant content for this chapter from those files rather than making it up.
+Context:
+- Course Overview: ${courseContextInfo}
+- Part: ${chapterInfo.partTitle}
+- Chapter: ${chapterInfo.title}
+${chapterInfo.guidance ? `- Chapter Objectives:\n${chapterInfo.guidance}\n` : ''}
 
-Only return valid JSON matching the schema. NEVER repeat the exact same paragraph or section over and over.`;
+Design Guidelines:${styleGuide}
+- Overall Tone: ${typeGuidance}
+
+Available Layout Blocks:
+1. "heading": A main section title. (content: the title text)
+2. "subheading": A secondary title to break up sections. (content: the subtitle text)
+3. "text": Standard learning content. Use markdown for lists, bolding, and formatting. (content: markdown format)
+4. "image_placeholder": Describe a specific, rich visual (chart, illustration, diagram). Our image AI will paint it. (content: description)
+5. "callout": A highlighted box for important tips or warnings. (calloutType: e.g., 'Tip', content: the message)
+6. "try_it": A practical reflection challenge or short exercise for the user. (title: exercise name, content: instructions)
+
+Instructions:
+- Sequence these blocks logically. Do not output one massive text block.
+- Start directly with the content. Avoid repetitive introductory phrases.
+- If referencing files, extract the relevant content directly.
+- Ensure the output strictly follows the JSON schema.`;
 
     const parts: any[] = [{ text: textPrompt }];
     if (files && files.length > 0) {
-      parts.push(...files);
+      files.forEach((f) => {
+        if (f.text) {
+          parts.push({ text: `\n--- File: ${f.name} ---\n${f.text}\n--- End of File ---\n` });
+        }
+      });
     }
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+    const responseStream = await ai.models.generateContentStream({
+      model: "gemini-3-flash-preview",
       contents: { parts },
       config: {
         responseMimeType: "application/json",
-        responseSchema: chapterSchema
+        responseSchema: chapterSchema,
+        maxOutputTokens: 10000
       }
     });
 
-    let jsonText = response.text || "{}";
-    const match = jsonText.match(/\{[\s\S]*\}/);
+    let jsonText = "";
+    let usageMetadata = null;
+    let tick = 0;
+    
+    for await (const chunk of responseStream) {
+      if (chunk.text) {
+        jsonText += chunk.text;
+      }
+      if (chunk.usageMetadata) usageMetadata = chunk.usageMetadata;
+      
+      if (onProgress) {
+        try {
+          let toRepair = jsonText;
+          const match = jsonText.match(/\{[\s\S]*/);
+          if (match) {
+              toRepair = match[0];
+              const repaired = jsonrepair(toRepair);
+              const partialData = JSON.parse(repaired);
+              onProgress({
+                ...partialData,
+                chapterId: chapterInfo.id,
+                id: chapterInfo.id,
+                isStreaming: true
+              });
+          }
+        } catch(e) {
+          // Silently ignore parse errors during streaming
+        }
+      }
+    }
+
+    if (userId && usageMetadata) {
+      await recordUsage(userId, 'gemini-3-flash-preview', usageMetadata.promptTokenCount, usageMetadata.candidatesTokenCount);
+    }
+
+    let finalJsonText = jsonText || "{}";
+    const match = finalJsonText.match(/\{[\s\S]*\}/);
     if (match) {
-      jsonText = match[0];
+      finalJsonText = match[0];
     }
     
     let chapterData;
     try {
-      chapterData = JSON.parse(jsonText);
+      chapterData = JSON.parse(finalJsonText);
     } catch (parseError) {
       console.warn("Standard JSON parse failed, attempting jsonrepair...", parseError);
       try {
-        chapterData = JSON.parse(jsonrepair(jsonText));
+        chapterData = JSON.parse(jsonrepair(finalJsonText));
       } catch (repairError) {
         throw new Error(`Chapter generation failed: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
       }
     }
 
-    // Save chapter
-    const chapterRef = doc(collection(db, 'courses', courseId, 'chapters'), chapterInfo.id);
+    // Save chapter as a new version
+    const versionId = `${chapterInfo.id}_${Date.now()}`;
+    const storagePath = `courses/${courseId}/chapters/${versionId}.json`;
+    const contentUrl = await uploadContent(storagePath, JSON.stringify(chapterData));
+
+    const chapterRef = doc(collection(db, 'courses', courseId, 'chapters'), versionId);
     await setDoc(chapterRef, {
+      id: versionId,
       courseId,
       userId,
       chapterId: chapterInfo.id,
-      ...chapterData,
+      contentUrl,
       order: orderIndex,
       createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
+      status: 'done'
     });
 
     return chapterData;
@@ -292,8 +409,81 @@ Only return valid JSON matching the schema. NEVER repeat the exact same paragrap
   }
 }
 
+export async function generateChatTitle(message: string): Promise<string> {
+  try {
+    const userId = auth.currentUser?.uid;
+    if (userId) {
+       await checkBudget(userId);
+    }
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: `Create a very short title (4-5 words max) for a chat that starts with this message:\n"${message}"\n\nOutput only the title, no quotes or additional text.`
+    });
+    return response.text?.trim() || "New Chat";
+  } catch (error) {
+    console.error("Title generation failed:", error);
+    return "New Chat";
+  }
+}
+
+export async function chatWithChapterStream(
+  chapterText: string, 
+  message: string, 
+  history: any[] = [], 
+  onChunk: (text: string) => void
+): Promise<string> {
+  try {
+     const userId = auth.currentUser?.uid;
+     if (userId) {
+       await checkBudget(userId);
+     }
+
+     const systemPrompt = `You are a helpful and educational AI assistant accompanying an interactive online course.
+Relevant chapter content context:
+---
+${chapterText.substring(0, 40000)}
+---
+Answer the user's question, summarize, or modify the text as requested. Use standard markdown formatting. Provide concise and helpful answers.`;
+
+     const contents = [...history, { role: 'user', parts: [{ text: `${systemPrompt}\n\nUser Request:\n${message}` }]}];
+
+     const responseStream = await ai.models.generateContentStream({
+       model: "gemini-3-flash-preview",
+       contents,
+       config: {
+         maxOutputTokens: 10000
+       }
+     });
+
+     let fullText = "";
+     let usageMetadata = null;
+
+     for await (const chunk of responseStream) {
+       if (chunk.text) {
+         fullText += chunk.text;
+         onChunk(fullText);
+       }
+       if (chunk.usageMetadata) usageMetadata = chunk.usageMetadata;
+     }
+
+     if (userId && usageMetadata) {
+       await recordUsage(userId, 'gemini-3-flash-preview', usageMetadata.promptTokenCount, usageMetadata.candidatesTokenCount);
+     }
+
+     return fullText || "No response generated.";
+  } catch (error) {
+     console.error("Chat generation failed:", error);
+     throw error;
+  }
+}
+
 export async function chatWithChapter(chapterText: string, message: string, history: any[] = []): Promise<string> {
   try {
+     const userId = auth.currentUser?.uid;
+     if (userId) {
+       await checkBudget(userId);
+     }
+
      const systemPrompt = `You are a helpful and educational AI assistant accompanying an interactive online course.
 Relevant chapter content context:
 ---
@@ -304,9 +494,17 @@ Answer the user's question, summarize, or modify the text as requested. Use stan
      const contents = [...history, { role: 'user', parts: [{ text: `${systemPrompt}\n\nUser Request:\n${message}` }]}];
 
      const response = await ai.models.generateContent({
-       model: "gemini-2.5-flash",
+       model: "gemini-3-flash-preview",
        contents,
+       config: {
+         maxOutputTokens: 10000
+       }
      });
+
+     if (userId && response.usageMetadata) {
+       await recordUsage(userId, 'gemini-3-flash-preview', response.usageMetadata.promptTokenCount, response.usageMetadata.candidatesTokenCount);
+     }
+
      return response.text || "No response generated.";
   } catch (error) {
      console.error("Chat generation failed:", error);

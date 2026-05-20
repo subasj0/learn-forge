@@ -1,6 +1,22 @@
 import { useState, useEffect } from 'react';
-import localforage from 'localforage';
-import { chatWithChapter } from '../lib/agents/courseGenerator';
+import { db } from '../lib/firebase';
+import { 
+  collection, 
+  query, 
+  where, 
+  orderBy, 
+  onSnapshot, 
+  addDoc, 
+  setDoc,
+  doc, 
+  serverTimestamp, 
+  updateDoc, 
+  deleteDoc,
+  Timestamp,
+  getDocs
+} from 'firebase/firestore';
+import { chatWithChapterStream, generateChatTitle } from '../lib/agents/courseGenerator';
+import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 
 export type ChatRole = 'user' | 'model';
 
@@ -8,82 +24,122 @@ export interface ChatMessage {
   id: string;
   role: ChatRole;
   text: string;
-  timestamp: number;
+  timestamp: any;
 }
 
 export interface ChatSession {
   id: string;
   title: string;
-  messages: ChatMessage[];
-  createdAt: number;
-  updatedAt: number;
+  courseId: string;
+  chapterId: string;
+  userId: string;
+  createdAt: any;
+  updatedAt: any;
+  messages?: ChatMessage[];
 }
 
-export function useAIChat(courseId: string | undefined, chapterId: string | null, chapterTextContext: string) {
+export function useAIChat(courseId: string | undefined, chapterId: string | null, chapterTextContext: string, userId: string | undefined) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [streamingMessageText, setStreamingMessageText] = useState<string>('');
 
+  // Load Sessions
   useEffect(() => {
-    async function load() {
-      if (!courseId || !chapterId) {
-        setSessions([]);
-        setActiveSessionId(null);
-        setSessionsLoaded(true);
-        return;
-      }
-      const key = `chat_sessions_${courseId}_${chapterId}`;
-      const saved = await localforage.getItem<ChatSession[]>(key);
-      if (saved && saved.length > 0) {
-        setSessions(saved);
-        setActiveSessionId(saved[0].id);
-      } else {
-        setSessions([]);
-        setActiveSessionId(null);
+    if (!courseId || !chapterId || !userId || userId === 'anonymous') {
+      setSessions([]);
+      setActiveSessionId(null);
+      setSessionsLoaded(true);
+      return;
+    }
+
+    const q = query(
+      collection(db, 'chatSessions'),
+      where('courseId', '==', courseId),
+      where('chapterId', '==', chapterId),
+      where('userId', '==', userId),
+      orderBy('updatedAt', 'desc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as ChatSession[];
+      setSessions(data);
+      if (data.length > 0 && !activeSessionId) {
+        setActiveSessionId(data[0].id);
       }
       setSessionsLoaded(true);
-    }
-    setSessionsLoaded(false);
-    load();
-  }, [courseId, chapterId]);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'chatSessions');
+      setSessionsLoaded(true);
+    });
 
-  const saveSessions = async (courseId: string, chapterId: string, newSessions: ChatSession[]) => {
-    setSessions(newSessions);
-    const key = `chat_sessions_${courseId}_${chapterId}`;
-    await localforage.setItem(key, newSessions);
-  };
+    return () => unsubscribe();
+  }, [courseId, chapterId, userId]);
+
+  // Load Messages for Active Session
+  useEffect(() => {
+    if (!activeSessionId) {
+      setActiveSession(null);
+      return;
+    }
+
+    const sessionMetadata = sessions.find(s => s.id === activeSessionId);
+    if (!sessionMetadata) return;
+
+    const q = query(
+      collection(db, 'chatSessions', activeSessionId, 'messages'),
+      orderBy('timestamp', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const messages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as ChatMessage[];
+      setActiveSession({ ...sessionMetadata, messages });
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, `chatSessions/${activeSessionId}/messages`);
+    });
+
+    return () => unsubscribe();
+  }, [activeSessionId, sessions]);
 
   const createNewSession = async (initialMessage?: string) => {
-    if (!courseId || !chapterId) return null;
-    const newSession: ChatSession = {
-      id: Date.now().toString(),
+    if (!courseId || !chapterId || !userId || userId === 'anonymous') return null;
+    
+    const docRef = await addDoc(collection(db, 'chatSessions'), {
+      courseId,
+      chapterId,
+      userId,
       title: initialMessage ? initialMessage.substring(0, 30) + '...' : 'New Chat',
-      messages: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    });
     
-    // Make sure we have latest state
-    const currentSessions = (await localforage.getItem<ChatSession[]>(`chat_sessions_${courseId}_${chapterId}`)) || [];
-    const updatedSessions = [newSession, ...currentSessions];
-    
-    await saveSessions(courseId, chapterId, updatedSessions);
-    setActiveSessionId(newSession.id);
-    return newSession.id;
+    setActiveSessionId(docRef.id);
+    return docRef.id;
   };
 
   const deleteSession = async (sessionId: string) => {
-    if (!courseId || !chapterId) return;
-    const updatedSessions = sessions.filter(s => s.id !== sessionId);
-    await saveSessions(courseId, chapterId, updatedSessions);
-    if (activeSessionId === sessionId) {
-      setActiveSessionId(updatedSessions[0]?.id || null);
+    try {
+      // First delete all messages
+      const msgs = await getDocs(collection(db, 'chatSessions', sessionId, 'messages'));
+      const batch: Promise<void>[] = [];
+      msgs.forEach(m => batch.push(deleteDoc(doc(db, 'chatSessions', sessionId, 'messages', m.id))));
+      await Promise.all(batch);
+      
+      // Then delete session
+      await deleteDoc(doc(db, 'chatSessions', sessionId));
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null);
+      }
+    } catch (e) {
+      console.error("Error deleting session", e);
     }
   };
 
   const sendMessage = async (text: string) => {
-    if (!text.trim() || !courseId || !chapterId) return;
+    if (!text.trim() || !courseId || !chapterId || !userId || userId === 'anonymous') return;
     
     let currentSessionId = activeSessionId;
     if (!currentSessionId) {
@@ -92,78 +148,69 @@ export function useAIChat(courseId: string | undefined, chapterId: string | null
     
     if (!currentSessionId) return;
 
-    // Use latest state to avoid clobbering
-    const currentSessions = (await localforage.getItem<ChatSession[]>(`chat_sessions_${courseId}_${chapterId}`)) || sessions;
-    const session = currentSessions.find(s => s.id === currentSessionId);
-    if (!session) return;
-
     setIsLoading(true);
-    
-    const userMsg: ChatMessage = {
-      id: Date.now().toString(),
-      role: 'user',
-      text,
-      timestamp: Date.now(),
-    };
-    
-    const newTitle = session.messages.length === 0 ? text.substring(0, 30) + '...' : session.title;
-    
-    let updatedWithUser = currentSessions.map(s => {
-      if (s.id === currentSessionId) {
-        return { ...s, title: newTitle, messages: [...s.messages, userMsg], updatedAt: Date.now() };
-      }
-      return s;
-    });
-    
-    await saveSessions(courseId, chapterId, updatedWithUser);
+    const sessionRef = doc(db, 'chatSessions', currentSessionId);
+    const messagesRef = collection(db, 'chatSessions', currentSessionId, 'messages');
     
     try {
-      const history = session.messages.map(m => ({
-          role: m.role,
-          parts: [{ text: m.text }]
+      // Add user message
+      await addDoc(messagesRef, {
+        role: 'user',
+        text,
+        timestamp: serverTimestamp()
+      });
+      
+      await updateDoc(sessionRef, { updatedAt: serverTimestamp() });
+
+      // Generate history for AI
+      const history = (activeSession?.messages || []).map(m => ({
+        role: m.role,
+        parts: [{ text: m.text }]
       }));
       
-      const resText = await chatWithChapter(chapterTextContext, text, history);
+      const modelMsgId = 'streaming-' + Date.now();
+      setStreamingMessageId(modelMsgId);
+      setStreamingMessageText('');
       
-      const modelMsg: ChatMessage = {
-        id: Date.now().toString(),
+      const resText = await chatWithChapterStream(chapterTextContext, text, history, (chunkText) => {
+        setStreamingMessageText(chunkText);
+      });
+      
+      // Add model message
+      await addDoc(messagesRef, {
         role: 'model',
         text: resText,
-        timestamp: Date.now(),
-      };
-      
-      // refetch to ensure we don't overwrite if user did something meanwhile
-      const freshSessions = (await localforage.getItem<ChatSession[]>(`chat_sessions_${courseId}_${chapterId}`)) || updatedWithUser;
-      
-      const finalSessions = freshSessions.map(s => {
-        if (s.id === currentSessionId) {
-          return { ...s, messages: [...s.messages, modelMsg], updatedAt: Date.now() };
-        }
-        return s;
+        timestamp: serverTimestamp()
       });
-      await saveSessions(courseId, chapterId, finalSessions);
-    } catch (e) {
+      
+      setStreamingMessageId(null);
+      setStreamingMessageText('');
+
+      // Auto title if first message
+      if (!activeSession?.messages || activeSession.messages.length <= 1) {
+        generateChatTitle(text).then(title => {
+          updateDoc(sessionRef, { title });
+        });
+      }
+
+    } catch (e: any) {
       console.error("Chat error", e);
-      const errorMsg: ChatMessage = {
-        id: Date.now().toString(),
+      let errorText = 'Sorry, I encountered an error answering your question.';
+      if (e.name === 'BudgetExceededError') {
+        errorText = e.message;
+        alert(e.message);
+      }
+      await addDoc(messagesRef, {
         role: 'model',
-        text: 'Sorry, I encountered an error answering your question.',
-        timestamp: Date.now(),
-      };
-      const freshSessions = (await localforage.getItem<ChatSession[]>(`chat_sessions_${courseId}_${chapterId}`)) || updatedWithUser;
-      const finalSessions = freshSessions.map(s => {
-        if (s.id === currentSessionId) {
-          return { ...s, messages: [...s.messages, errorMsg], updatedAt: Date.now() };
-        }
-        return s;
+        text: errorText,
+        timestamp: serverTimestamp()
       });
-      await saveSessions(courseId, chapterId, finalSessions);
+      setStreamingMessageId(null);
+      setStreamingMessageText('');
     } finally {
       setIsLoading(false);
     }
   };
-
-  const activeSession = sessions.find(s => s.id === activeSessionId) || null;
 
   return {
     sessions,
@@ -172,6 +219,8 @@ export function useAIChat(courseId: string | undefined, chapterId: string | null
     setActiveSessionId,
     isLoading,
     sessionsLoaded,
+    streamingMessageId,
+    streamingMessageText,
     createNewSession,
     deleteSession,
     sendMessage

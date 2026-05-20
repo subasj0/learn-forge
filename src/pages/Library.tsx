@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useAuth } from '../lib/auth';
 import { db } from '../lib/firebase';
 import { collection, query, where, onSnapshot, doc, deleteDoc, updateDoc } from 'firebase/firestore';
+import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 import { Link } from 'react-router';
 import { LayoutTemplate, Trash2, MoreVertical, Loader2, Globe, Lock } from 'lucide-react';
 import { ModuleCard } from '../components/ModuleCard';
@@ -73,6 +74,9 @@ export default function Library() {
       });
 
       setCourses(docs);
+      setLoading(false);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'courses');
       setLoading(false);
     });
 

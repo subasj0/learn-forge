@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState, ReactNode } from 'react
 import { User, onAuthStateChanged } from 'firebase/auth';
 import { auth, db } from './firebase';
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { handleFirestoreError, OperationType } from './firestoreUtils';
 
 export interface AuthContextType {
   user: User | null;
@@ -46,7 +47,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
             });
           }
         } catch (error) {
-          console.error("Failed to map user to firestore", error);
+          handleFirestoreError(error, OperationType.GET, `users/${currentUser.uid}`);
         }
       }
       setUser(currentUser);

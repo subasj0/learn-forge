@@ -92,12 +92,64 @@
         }
       },
       "required": ["courseId", "chapterId", "mainContent", "sidebarContent", "order", "createdAt", "updatedAt"]
+    },
+    "BillingUsage": {
+      "title": "BillingUsage",
+      "description": "Usage limits tracked for each user",
+      "type": "object",
+      "properties": {
+        "dailyCost": {
+          "type": "number"
+        },
+        "monthlyCost": {
+          "type": "number"
+        },
+        "totalCost": {
+          "type": "number"
+        },
+        "lastDailyUpdate": {
+          "type": "string"
+        },
+        "lastMonthlyUpdate": {
+          "type": "string"
+        }
+      },
+      "required": ["dailyCost", "monthlyCost", "totalCost", "lastDailyUpdate", "lastMonthlyUpdate"]
+    },
+    "AIChatSession": {
+      "title": "AIChatSession",
+      "description": "An AI chat session related to a course/chapter",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "courseId": { "type": "string" },
+        "chapterId": { "type": "string" },
+        "title": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "courseId", "chapterId", "title", "createdAt", "updatedAt"]
+    },
+    "AIChatMessage": {
+      "title": "AIChatMessage",
+      "description": "Individual message in a chat session",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "text": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["role", "text", "timestamp"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/User" },
       "description": "User profiles"
+    },
+    "/users/{userId}/billing/usage": {
+      "schema": { "$ref": "#/entities/BillingUsage" },
+      "description": "Usage tracking for user budget"
     },
     "/courses/{courseId}": {
       "schema": { "$ref": "#/entities/Course" },
@@ -106,6 +158,14 @@
     "/courses/{courseId}/chapters/{chapterId}": {
       "schema": { "$ref": "#/entities/Chapter" },
       "description": "Chapters inside a course"
+    },
+    "/chatSessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/AIChatSession" },
+      "description": "Chat sessions"
+    },
+    "/chatSessions/{sessionId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/AIChatMessage" },
+      "description": "Messages in a chat session"
     }
   }
 }

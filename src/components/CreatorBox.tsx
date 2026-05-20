@@ -1,26 +1,38 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Paperclip, Settings, Send, Sparkles, ChevronDown, CheckSquare, Layers, FileText, Zap, X } from 'lucide-react';
+import { Paperclip, Settings, Send, Sparkles, ChevronDown, CheckSquare, Layers, FileText, Zap, X, BookOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 const MODULE_TYPES = [
-  { id: 'guided', icon: Sparkles, title: 'Guided Lesson' },
-  { id: 'quick', icon: Zap, title: 'Quick Review' },
+  { id: 'guided', icon: BookOpen, title: 'Guided Lesson' },
+  { id: 'interactive', icon: Sparkles, title: 'Interactive Module' },
+  { id: 'quick', icon: Zap, title: 'Explore New Topic' },
   { id: 'quiz', icon: CheckSquare, title: 'Quiz' },
   { id: 'flashcards', icon: Layers, title: 'Flashcards' },
 ];
+
+export interface ExtractedFile {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  text?: string;
+  status: 'uploading' | 'processing' | 'done' | 'error';
+  progress: number;
+}
 
 export interface PersonalizationOptions {
   complexity: string;
   intent: string;
   interests: string;
   interactivity: 'minimal' | 'medium' | 'high';
+  learningStyle: 'balanced' | 'visual' | 'hands-on';
 }
 
 interface CreatorBoxProps {
   content: string;
   setContent: (val: string) => void;
-  files: File[];
-  setFiles: React.Dispatch<React.SetStateAction<File[]>>;
+  files: ExtractedFile[];
+  setFiles: React.Dispatch<React.SetStateAction<ExtractedFile[]>>;
   moduleType: string;
   setModuleType: (val: string) => void;
   onSubmit: () => void;
@@ -34,6 +46,8 @@ function formatFileSize(bytes: number) {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 }
+
+import { extractTextFromFile } from '../lib/agents/ocr';
 
 export function CreatorBox({
   content,
@@ -51,13 +65,12 @@ export function CreatorBox({
   const [showPersonalization, setShowPersonalization] = useState(false);
 
   const [personalization, setPersonalization] = useState<PersonalizationOptions>({
-    complexity: 'Beginner',
+    complexity: 'Primary Level',
     intent: '',
     interests: '',
-    interactivity: 'medium'
+    interactivity: 'medium',
+    learningStyle: 'balanced'
   });
-  
-  const [uploadStates, setUploadStates] = useState<Record<string, { progress: number; status: 'uploading' | 'done' }>>({});
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -80,37 +93,43 @@ export function CreatorBox({
   const textId = React.useId(); // we can use React.useId directly, wait React is imported as default
   const fileInputId = React.useId();
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.length) {
       const newFiles = Array.from(e.target.files);
-      setFiles(prev => [...prev, ...newFiles]);
+      const newExtractedFiles: ExtractedFile[] = newFiles.map(f => ({
+        id: Math.random().toString(36).substring(7),
+        name: f.name,
+        size: f.size,
+        type: f.type,
+        status: 'uploading',
+        progress: 10
+      }));
 
-      setUploadStates(prevStates => {
-        const nextStates = { ...prevStates };
-        newFiles.forEach((f) => {
-          const key = `${f.name}-${f.size}-${f.lastModified}`;
-          nextStates[key] = { progress: 0, status: 'uploading' };
-          
-          let progress = 0;
-          const interval = setInterval(() => {
-            progress += Math.random() * 25 + 10;
-            if (progress >= 100) {
-              progress = 100;
-              setUploadStates(prev => ({ ...prev, [key]: { progress: 100, status: 'done' } }));
-              clearInterval(interval);
-            } else {
-              setUploadStates(prev => ({ ...prev, [key]: { progress, status: 'uploading' } }));
-            }
-          }, 150 + Math.random() * 100);
-        });
-        return nextStates;
-      });
+      setFiles(prev => [...prev, ...newExtractedFiles]);
+
+      if (fileInputRef.current) fileInputRef.current.value = '';
+
+      for (let i = 0; i < newFiles.length; i++) {
+        const file = newFiles[i];
+        const fileRecord = newExtractedFiles[i];
+        
+        try {
+          setFiles(prev => prev.map(f => f.id === fileRecord.id ? { ...f, status: 'processing', progress: 50 } : f));
+          const text = await extractTextFromFile(file);
+          setFiles(prev => prev.map(f => f.id === fileRecord.id ? { ...f, status: 'done', progress: 100, text } : f));
+        } catch (error: any) {
+          console.error("OCR failed for", file.name, error);
+          setFiles(prev => prev.map(f => f.id === fileRecord.id ? { ...f, status: 'error', progress: 0 } : f));
+          if (error.name === 'BudgetExceededError') {
+            alert(error.message);
+          }
+        }
+      }
     }
-    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const removeFile = (index: number) => {
-    setFiles(prev => prev.filter((_, i) => i !== index));
+  const removeFile = (id: string) => {
+    setFiles(prev => prev.filter(f => f.id !== id));
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -166,22 +185,21 @@ export function CreatorBox({
           <>
             <style>{`.custom-scrollbar::-webkit-scrollbar { height: 6px; width: 6px; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; } .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }`}</style>
             <div className="flex flex-wrap items-center gap-2 justify-end flex-1 ml-6 overflow-y-auto max-h-[140px] custom-scrollbar pr-1">
-              {files.map((f, i) => {
-                const key = `${f.name}-${f.size}-${f.lastModified}`;
-                const upState = uploadStates[key] || { progress: 100, status: 'done' };
-                const isUploading = upState.status === 'uploading';
+              {files.map((f) => {
+                const isUploading = f.status === 'uploading' || f.status === 'processing';
+                const hasError = f.status === 'error';
 
                 return (
-                  <div key={i} className="flex items-center bg-white border border-gray-200 rounded-xl px-3 py-2 shadow-sm min-w-0 w-[200px] relative overflow-hidden group">
+                  <div key={f.id} className={`flex items-center bg-white border ${hasError ? 'border-red-200' : 'border-gray-200'} rounded-xl px-3 py-2 shadow-sm min-w-0 w-[200px] relative overflow-hidden group`}>
                     {/* Progress bar background */}
                     {isUploading && (
                       <div 
                         className="absolute left-0 bottom-0 top-0 bg-indigo-50/50 transition-all duration-300 z-0 ease-out" 
-                        style={{ width: `${upState.progress}%` }} 
+                        style={{ width: `${f.progress}%` }} 
                       />
                     )}
 
-                    <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center text-indigo-500 flex-shrink-0 mr-3 z-10">
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mr-3 z-10 ${hasError ? 'bg-red-50 text-red-500' : 'bg-indigo-50 text-indigo-500'}`}>
                       {isUploading ? (
                         <div className="w-4 h-4 border-[2px] border-indigo-500 border-t-transparent rounded-full animate-spin" />
                       ) : (
@@ -190,12 +208,12 @@ export function CreatorBox({
                     </div>
                     <div className="flex-1 min-w-0 flex flex-col justify-center z-10">
                       <div className="text-xs font-medium text-gray-700 truncate">{f.name}</div>
-                      <div className="text-[10px] text-gray-400 leading-none mt-1">
-                        {isUploading ? `Uploading... ${Math.round(upState.progress)}%` : formatFileSize(f.size)}
+                      <div className={`text-[10px] leading-none mt-1 ${hasError ? 'text-red-400' : 'text-gray-400'}`}>
+                        {f.status === 'processing' ? 'Extracting text...' : isUploading ? `Uploading... ${Math.round(f.progress)}%` : hasError ? 'Failed to read' : formatFileSize(f.size)}
                       </div>
                     </div>
                     <button 
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); removeFile(i); }} 
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); removeFile(f.id); }} 
                       className="ml-2 p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-colors flex-shrink-0 z-10 sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100"
                     >
                       <X className="w-3.5 h-3.5" />
@@ -352,6 +370,26 @@ export function CreatorBox({
                               }`}
                             >
                               {level}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Learning Style */}
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Learning Style</label>
+                        <div className="flex bg-gray-100 rounded-lg p-1">
+                          {(['balanced', 'visual', 'hands-on'] as const).map(style => (
+                            <button
+                              key={style}
+                              onClick={() => setPersonalization(p => ({...p, learningStyle: style}))}
+                              className={`flex-1 text-xs py-1.5 rounded-md font-medium capitalize transition-colors ${
+                                personalization.learningStyle === style 
+                                  ? 'bg-white text-gray-900 shadow-sm' 
+                                  : 'text-gray-500 hover:text-gray-700'
+                              }`}
+                            >
+                              {style}
                             </button>
                           ))}
                         </div>

@@ -11,6 +11,7 @@ import {
   where,
   updateDoc,
 } from "firebase/firestore";
+import { handleFirestoreError, OperationType } from "../../lib/firestoreUtils";
 import Markdown from "react-markdown";
 import {
   CheckCircle2,
@@ -34,7 +35,13 @@ import {
   Notebook,
   Globe,
   Lock,
-  Share2
+  Share2,
+  Maximize2,
+  Minimize2,
+  Target,
+  Zap,
+  History,
+  RotateCcw
 } from "lucide-react";
 import localforage from "localforage";
 import {
@@ -42,7 +49,235 @@ import {
   generateChapterContent,
   chatWithChapter,
 } from "../../lib/agents/courseGenerator";
+import { generateInteractiveChapter } from "../../lib/agents/interactiveAgent";
+import { fetchJson } from "../../lib/storage";
 import { useAIChat } from "../../hooks/useAIChat";
+import { Runner } from "react-runner";
+import * as LucideIcons from "lucide-react";
+import * as Motion from "motion/react";
+import * as Recharts from "recharts";
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+class InteractiveErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean; error: any }> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-8 bg-rose-50 border border-rose-200 rounded-3xl text-center">
+          <LucideIcons.AlertCircle className="w-10 h-10 text-rose-500 mx-auto mb-4" />
+          <h3 className="font-bold text-rose-900 mb-2">Interactive Component Error</h3>
+          <p className="text-sm text-rose-700 mb-4">There was an error rendering this interactive chapter.</p>
+          <pre className="text-[10px] bg-white p-4 rounded-xl border border-rose-100 overflow-x-auto text-left max-h-40">
+            {this.state.error?.message || String(this.state.error)}
+          </pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const InteractiveChapter = React.memo(function InteractiveChapter({ 
+  code, 
+  annotations, 
+  activeChapterId,
+  onHighlightClick,
+  activeAnnotationId
+}: { 
+  code: string; 
+  annotations: any[]; 
+  activeChapterId: string;
+  onHighlightClick: (id: string, text: string, note: string) => void;
+  activeAnnotationId: string | null;
+}) {
+  if (!code) return null;
+
+  const containerRef = React.useRef<HTMLDivElement>(null);
+
+  // Extract code from block if wrapped in markdown
+  const cleanedCode = React.useMemo(() => {
+    const codeMatch = code.match(/```(?:typescript|tsx|javascript|jsx)?\n([\s\S]*?)(?:```|$)/);
+    if (codeMatch) {
+      return codeMatch[1].trim();
+    } else {
+      return code.replace(/```(?:typescript|tsx|javascript|jsx)?/g, "").replace(/```/g, "").trim();
+    }
+  }, [code]);
+
+  const [runnerError, setRunnerError] = React.useState<string | null>(null);
+
+  // Strip imports as react-runner provides them via scope
+  const strippedCode = React.useMemo(() => {
+    return cleanedCode
+      .replace(/^import\s+[\s\S]*?from\s+['"].*?['"];?\s*$/gm, "")
+      .replace(/^import\s+['"].*?['"];?\s*$/gm, "");
+  }, [cleanedCode]);
+
+  const scope = React.useMemo(() => ({
+    React,
+    ...React,
+    ...LucideIcons,
+    ...Motion,
+    ...Recharts,
+    cn,
+    motion: Motion.motion,
+    AnimatePresence: Motion.AnimatePresence,
+  }), []);
+
+  React.useEffect(() => {
+    if (!containerRef.current) return;
+
+    const observer = new MutationObserver((mutations) => {
+      // Check if mutations actually added/removed nodes that aren't our highlights
+      const isOurMark = (n: Node) => (n as HTMLElement).classList?.contains?.('forge-highlight');
+      const isOurMutation = mutations.every(m => {
+        return isOurMark(m.target) || 
+               Array.from(m.addedNodes).every(isOurMark) || 
+               Array.from(m.removedNodes).every(isOurMark);
+      });
+      
+      if (!isOurMutation) {
+        applyHighlights();
+      }
+    });
+
+    const applyHighlights = () => {
+      if (!containerRef.current) return;
+      
+      observer.disconnect();
+      
+      // Remove previous marks
+      const existingMarks = containerRef.current.querySelectorAll('mark.forge-highlight');
+      existingMarks.forEach(m => {
+        const parent = m.parentNode;
+        if (parent) {
+          const text = m.textContent;
+          parent.replaceChild(document.createTextNode(text || ''), m);
+          parent.normalize(); // merge adjacent text nodes
+        }
+      });
+
+      const chapterAnnos = annotations.filter(a => a.chapterId === activeChapterId && (a.blockIdx === null || a.blockIdx === 0));
+      
+      chapterAnnos.forEach(anno => {
+        if (!anno.text) return;
+        
+        // Find text nodes and wrap
+        const walker = document.createTreeWalker(containerRef.current!, NodeFilter.SHOW_TEXT, null);
+        let node;
+        let found = false;
+        let count = 0;
+        
+        const nodes: Text[] = [];
+        while(node = walker.nextNode()) nodes.push(node as Text);
+
+        for (const textNode of nodes) {
+           if (found) break;
+           
+           let content = textNode.nodeValue || '';
+           let index = content.indexOf(anno.text);
+           while (index !== -1) {
+             count++;
+             if (!anno.occurrence || count === anno.occurrence) {
+               const parent = textNode.parentNode;
+               if (!parent || (parent as HTMLElement).closest('mark.forge-highlight')) {
+                  index = content.indexOf(anno.text, index + 1);
+                  continue;
+               }
+
+               const mark = document.createElement('mark');
+               mark.id = `mark-${anno.id}`;
+               
+               let colorClasses = "bg-yellow-200 text-yellow-900 border-b-2 border-yellow-300";
+               if (anno.color === "green") colorClasses = "bg-green-200 text-green-900 border-b-2 border-green-300";
+               if (anno.color === "blue") colorClasses = "bg-blue-200 text-blue-900 border-b-2 border-blue-300";
+               if (anno.color === "pink") colorClasses = "bg-rose-200 text-rose-900 border-b-2 border-rose-300";
+               
+               mark.className = `${colorClasses} cursor-pointer rounded px-1 transition-all hover:opacity-80 forge-highlight ${activeAnnotationId === anno.id ? 'ring-2 ring-indigo-500' : ''}`;
+               mark.textContent = anno.text;
+               mark.onclick = (e) => {
+                 e.preventDefault();
+                 e.stopPropagation();
+                 onHighlightClick(anno.id, anno.text || '', anno.note || '');
+               };
+               
+               const afterText = document.createTextNode(content.substring(index + anno.text.length));
+               textNode.nodeValue = content.substring(0, index);
+               
+               parent.insertBefore(mark, textNode.nextSibling);
+               parent.insertBefore(afterText, mark.nextSibling);
+               found = true;
+               break;
+             }
+             index = content.indexOf(anno.text, index + 1);
+           }
+        }
+      });
+
+      observer.observe(containerRef.current, { childList: true, subtree: true });
+    };
+
+    applyHighlights();
+    
+    return () => observer.disconnect();
+  }, [code, annotations, activeChapterId, activeAnnotationId, onHighlightClick]);
+
+  // Basic check to see if we have enough code to potentially render
+  if (!cleanedCode.toLowerCase().includes("export default")) {
+    return (
+      <div className="flex flex-col items-center justify-center p-12 bg-gray-50 rounded-3xl border border-dashed border-gray-200">
+        <Loader2 className="w-8 h-8 animate-spin text-indigo-500 mb-4" />
+        <p className="text-sm text-gray-500 italic">Designing interactive module...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div 
+      ref={containerRef}
+      className="interactive-chapter-container"
+      data-block-idx="0" // Treat interactive as block 0
+    >
+      <InteractiveErrorBoundary>
+        {runnerError && (
+          <div className="p-8 bg-rose-50 border border-rose-200 rounded-3xl text-center mb-6">
+            <LucideIcons.AlertCircle className="w-10 h-10 text-rose-500 mx-auto mb-4" />
+            <h3 className="font-bold text-rose-900 mb-2">Build Error</h3>
+            <p className="text-sm text-rose-700 mb-4">There was a problem compiling the generated code.</p>
+            <pre className="text-[10px] bg-white p-4 rounded-xl border border-rose-100 overflow-x-auto text-left max-h-40 whitespace-pre-wrap">
+              {runnerError}
+            </pre>
+          </div>
+        )}
+        <Runner
+          code={strippedCode}
+          scope={scope}
+          onRendered={(error) => {
+            if (error) {
+              const msg = error.message || String(error);
+              if (runnerError !== msg) {
+                setRunnerError(msg);
+              }
+            } else if (runnerError !== null) {
+              setRunnerError(null);
+            }
+          }}
+        />
+      </InteractiveErrorBoundary>
+    </div>
+  );
+});
 
 function TryItBlock({ block }: { block: any }) {
   const [value, setValue] = useState("");
@@ -168,6 +403,20 @@ export default function BookViewer() {
   const [generatingChapterIds, setGeneratingChapterIds] = useState<
     Record<string, "generating" | "failed">
   >({});
+  const [streamingChapters, setStreamingChapters] = useState<Record<string, any>>({});
+
+  // Generation configuration state
+  const [genConfig, setGenConfig] = useState({
+    guidance: "",
+    tone: "conversational",
+    depth: "detailed",
+    focus: ""
+  });
+  const [showGenConfig, setShowGenConfig] = useState(false);
+
+  const [isChatExpanded, setIsChatExpanded] = useState(false);
+  const [isHeaderHovered, setIsHeaderHovered] = useState(false);
+  const [isChatMenuOpen, setIsChatMenuOpen] = useState(false);
 
   const [fontSize, setFontSize] = useState<number>(17);
   const [fontFamily, setFontFamily] = useState<string>("font-sans");
@@ -177,6 +426,7 @@ export default function BookViewer() {
     left: number;
     text: string;
     blockIdx: number | null;
+    occurrence?: number;
   }>({ top: 0, left: 0, text: "", blockIdx: null });
   const [isSelectionBoxVisible, setIsSelectionBoxVisible] = useState(false);
 
@@ -192,13 +442,90 @@ export default function BookViewer() {
   const [addCustomPrompt, setAddCustomPrompt] = useState<string>("");
   const [isGeneratingNewBlock, setIsGeneratingNewBlock] = useState(false);
 
-  const activeChapterData = chapters.find(
-    (c) => c.chapterId === activeChapterId,
-  );
-  const chapterTextContext =
-    activeChapterData?.mainContent
-      ?.map((b: any) => b.content || "")
-      .join("\n") || "";
+  const [externalContent, setExternalContent] = useState<Record<string, any>>({});
+  const [loadingExternal, setLoadingExternal] = useState<Record<string, boolean>>({});
+
+  const dbChaptersForActive = React.useMemo(() => {
+    if (!chapters || !activeChapterId) return [];
+    return chapters.filter((c) => c.chapterId === activeChapterId || c.id === activeChapterId)
+      .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+  }, [chapters, activeChapterId]);
+
+  const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
+
+  const dbChapter = React.useMemo(() => {
+    if (!dbChaptersForActive.length) return null;
+    if (selectedVersionId) {
+      return dbChaptersForActive.find(c => c.id === selectedVersionId) || dbChaptersForActive[0];
+    }
+    return dbChaptersForActive[0];
+  }, [dbChaptersForActive, selectedVersionId]);
+
+  const activeChapterData = React.useMemo(() => {
+    if (!activeChapterId) return null;
+    
+    const streaming = streamingChapters[activeChapterId];
+    if (streaming) return streaming;
+    
+    if (!dbChapter) return null;
+    
+    const extContent = externalContent[dbChapter.id];
+    return {
+      ...dbChapter,
+      ...(extContent ? (typeof extContent === 'object' ? extContent : { componentCode: extContent }) : {})
+    };
+  }, [streamingChapters, activeChapterId, dbChapter, externalContent]);
+
+  const chapterInOutline = course?.outline?.flatMap((p: any) => p.chapters).find((c: any) => c.id === activeChapterId);
+  const displayTitle = chapterInOutline?.title || (activeChapterData?.chapterId || activeChapterId || "")
+    .split("-")
+    .map((s: string) => s.charAt(0).toUpperCase() + s.slice(1))
+    .join(" ");
+
+  const chapterTextContext = React.useMemo(() => {
+    if (!activeChapterData) return "";
+    
+    // For regular chapters, use blocks
+    if (activeChapterData.mainContent?.length) {
+      return activeChapterData.mainContent
+        .map((b: any) => b.content || "")
+        .join("\n");
+    }
+    
+    // For interactive chapters, extract text literals from code
+    if (activeChapterData.componentCode) {
+      // Better text extraction from JSX/Code string
+      let code = activeChapterData.componentCode;
+      
+      // Extract all string literals and JSX children
+      const strings: string[] = [];
+      
+      // Matches double quoted strings
+      const doubleQuotes = code.match(/"([^"\\]*(\\.[^"\\]*)*)"/g);
+      if (doubleQuotes) strings.push(...doubleQuotes.map(s => s.slice(1, -1)));
+      
+      // Matches single quoted strings
+      const singleQuotes = code.match(/'([^'\\]*(\\.[^'\\]*)*)'/g);
+      if (singleQuotes) strings.push(...singleQuotes.map(s => s.slice(1, -1)));
+      
+      // Matches template literals
+      const templates = code.match(/`([^`\\]*(\\.[^`\\]*)*)`/g);
+      if (templates) strings.push(...templates.map(s => s.slice(1, -1)));
+      
+      // Matches text between tags: >Text<
+      const jsxText = code.match(/>([^<>{}]*)<(?!\/)/g);
+      if (jsxText) strings.push(...jsxText.map(s => s.slice(1, -1)));
+
+      const extractedText = Array.from(new Set(strings))
+        .filter(s => s.trim().length > 3)
+        .join("\n");
+
+      // Also include the code itself so AI understands the logic/widgets
+      return `[extracted visible text]:\n${extractedText}\n\n[source code logic]:\n${code}`.substring(0, 50000);
+    }
+    
+    return "";
+  }, [activeChapterData]);
 
   const {
     sessions: chatSessions,
@@ -206,10 +533,11 @@ export default function BookViewer() {
     activeSessionId,
     setActiveSessionId,
     isLoading: isChatLoading,
+    streamingMessageText,
     createNewSession,
     deleteSession,
     sendMessage,
-  } = useAIChat(courseId, activeChapterId, chapterTextContext);
+  } = useAIChat(courseId, activeChapterId, chapterTextContext, user?.uid || "anonymous");
 
   const [chatInput, setChatInput] = useState("");
   const [chatSelectionContext, setChatSelectionContext] = useState<
@@ -226,6 +554,7 @@ export default function BookViewer() {
     chapterId?: string;
     chapterTitle?: string;
     blockIdx?: number | null;
+    occurrence?: number;
   }
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(
@@ -252,6 +581,30 @@ export default function BookViewer() {
   const [generatingImages, setGeneratingImages] = useState<Record<number, boolean>>({});
 
   useEffect(() => {
+    async function loadExternal() {
+      if (!activeChapterId || streamingChapters[activeChapterId]) return;
+      
+      const chap = dbChapter;
+      if (chap && chap.contentUrl && !externalContent[chap.id] && !loadingExternal[chap.id]) {
+        setLoadingExternal(prev => ({ ...prev, [chap.id]: true }));
+        try {
+          console.log(`Loading content for version ${chap.id}...`);
+          const resp = await fetch(chap.contentUrl);
+          if (resp.ok) {
+            const data = await resp.json();
+            setExternalContent(prev => ({ ...prev, [chap.id]: data }));
+          }
+        } catch (err) {
+          console.error("Failed to load external content", err);
+        } finally {
+          setLoadingExternal(prev => ({ ...prev, [chap.id]: false }));
+        }
+      }
+    }
+    loadExternal();
+  }, [activeChapterId, dbChapter, chapters, streamingChapters, externalContent, loadingExternal]);
+
+  useEffect(() => {
     async function generateTOC() {
       if (
         !courseId ||
@@ -265,9 +618,12 @@ export default function BookViewer() {
         const files = await localforage.getItem<any[]>(
           `course_files_${courseId}`,
         );
-        await generateCourseOutline(courseId, course.topic, files || undefined);
-      } catch (err) {
+        await generateCourseOutline(courseId, course.topic, files || undefined, course.moduleType, course.personalization);
+      } catch (err: any) {
         console.error("error generating TOC", err);
+        if (err.name === 'BudgetExceededError') {
+          alert(err.message);
+        }
       } finally {
         setIsGeneratingOutline(false);
       }
@@ -278,8 +634,9 @@ export default function BookViewer() {
   useEffect(() => {
     async function loadNotes() {
       if (courseId) {
+        const userId = user?.uid || "anonymous";
         const savedNotes = await localforage.getItem<any>(
-          `course_notes_${courseId}`,
+          `course_notes_${courseId}_${userId}`,
         );
         if (savedNotes) {
           const migrated = savedNotes.map((n: any) => ({
@@ -288,17 +645,20 @@ export default function BookViewer() {
             color: n.color || (n.note ? "green" : "yellow"),
           }));
           setAnnotations(migrated);
+        } else {
+          setAnnotations([]);
         }
       }
     }
     loadNotes();
-  }, [courseId]);
+  }, [courseId, user?.uid]);
 
   useEffect(() => {
     if (courseId) {
-      localforage.setItem(`course_notes_${courseId}`, annotations);
+      const userId = user?.uid || "anonymous";
+      localforage.setItem(`course_notes_${courseId}_${userId}`, annotations);
     }
-  }, [annotations, courseId]);
+  }, [annotations, courseId, user?.uid]);
 
   const handleMouseUp = () => {
     const selection = window.getSelection();
@@ -318,8 +678,10 @@ export default function BookViewer() {
 
     const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
-    const anchorNode = selection.anchorNode;
-    const blockElement = anchorNode?.parentElement?.closest("[data-block-idx]");
+    const text = selection.toString().trim();
+    const startNode = range.startContainer;
+
+    const blockElement = startNode?.parentElement?.closest("[data-block-idx]");
     let blockIdx = null;
     if (blockElement) {
       blockIdx = parseInt(
@@ -328,11 +690,40 @@ export default function BookViewer() {
       );
     }
 
+    let occurrence = 1;
+    // For interactive modules, calculate the occurrence within the interactive container
+    const isInteractive = activeChapterData?.moduleType === 'interactive' || !!activeChapterData?.componentCode;
+    
+    if (isInteractive) {
+      const container = document.querySelector('.interactive-chapter-container');
+      if (container) {
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+        let n;
+        let count = 0;
+        let found = false;
+        while (n = walker.nextNode()) {
+          const content = n.nodeValue || '';
+          let pos = content.indexOf(text);
+          while (pos !== -1) {
+            count++;
+            if (n === startNode && pos === range.startOffset) {
+              occurrence = count;
+              found = true;
+              break;
+            }
+            pos = content.indexOf(text, pos + 1);
+          }
+          if (found) break;
+        }
+      }
+    }
+
     setSelectionBox({
       top: rect.top - 50,
       left: rect.left + rect.width / 2,
-      text: selection.toString().trim(),
+      text,
       blockIdx,
+      occurrence,
     });
     setIsSelectionBoxVisible(true);
   };
@@ -343,7 +734,7 @@ export default function BookViewer() {
       course?.outline?.length > 0 &&
       course.outline[0].chapters?.length > 0
     ) {
-      setActiveChapterId(course.outline[0].chapters[0].id);
+      handleChapterChange(course.outline[0].chapters[0].id);
     }
   }, [course, activeChapterId]);
 
@@ -362,7 +753,7 @@ export default function BookViewer() {
             setCourse(cData);
           }
         },
-        (err) => console.error("Error fetching course:", err)
+        (err) => handleFirestoreError(err, OperationType.GET, `courses/${courseId}`)
       );
 
       try {
@@ -374,9 +765,9 @@ export default function BookViewer() {
           chaps.sort((a, b) => (a.order || 0) - (b.order || 0));
           setChapters(chaps);
           setChaptersLoaded(true);
-        }, (err) => console.error("Error fetching chapters:", err));
+        }, (err) => handleFirestoreError(err, OperationType.LIST, `courses/${courseId}/chapters`));
       } catch (err) {
-        console.error("Error loading chapters:", err);
+        handleFirestoreError(err, OperationType.LIST, `courses/${courseId}/chapters`);
       }
     }
 
@@ -387,7 +778,19 @@ export default function BookViewer() {
     };
   }, [courseId, user]);
 
-  async function generateChapter(chapId: string) {
+  useEffect(() => {
+    if (course && activeChapterId && !genConfig.guidance) {
+      const chapterInOutline = course?.outline?.flatMap((p: any) => p.chapters).find((c: any) => c.id === activeChapterId);
+      if (chapterInOutline) {
+        setGenConfig(prev => ({
+          ...prev,
+          guidance: chapterInOutline.guidance || ""
+        }));
+      }
+    }
+  }, [course, activeChapterId]);
+
+  async function generateChapter(chapId: string, customConfig?: typeof genConfig) {
     if (!courseId || !user || !course) return;
     setGeneratingChapterIds((prev) => ({ ...prev, [chapId]: "generating" }));
 
@@ -411,26 +814,87 @@ export default function BookViewer() {
       return;
     }
 
+    // Merge personalization with custom config
+    const mergedPersonalization = {
+      ...course.personalization,
+      ...(customConfig ? {
+        customGuidance: customConfig.guidance,
+        tone: customConfig.tone,
+        depth: customConfig.depth,
+        focus: customConfig.focus
+      } : {})
+    };
+
     try {
       const files = await localforage.getItem<any[]>(
         `course_files_${courseId}`,
       );
-      await generateChapterContent(
-        courseId,
-        {
-          id: targetChap.id,
-          title: targetChap.title,
-          partTitle: targetPart.title,
-          guidance: targetChap.guidance,
-        },
-        course.topic,
-        orderIndex,
-        user.uid,
-        files || undefined,
-      );
-    } catch (e) {
+
+      if (course.moduleType === 'interactive') {
+        await generateInteractiveChapter(
+          courseId,
+          {
+            id: targetChap.id,
+            title: targetChap.title,
+            partTitle: targetPart.title,
+            guidance: customConfig?.guidance || targetChap.guidance,
+          },
+          course.topic,
+          orderIndex,
+          user.uid,
+          files || undefined,
+          mergedPersonalization,
+          (partialData) => {
+            setStreamingChapters((prev) => ({
+              ...prev,
+              [targetChap.id]: {
+                ...partialData,
+                id: targetChap.id,
+                chapterId: targetChap.id,
+              },
+            }));
+          }
+        );
+      } else {
+        await generateChapterContent(
+          courseId,
+          {
+            id: targetChap.id,
+            title: targetChap.title,
+            partTitle: targetPart.title,
+            guidance: customConfig?.guidance || targetChap.guidance,
+          },
+          course.topic,
+          orderIndex,
+          user.uid,
+          files || undefined,
+          course.moduleType,
+          mergedPersonalization,
+          (partialData) => {
+            setStreamingChapters((prev) => ({
+              ...prev,
+              [targetChap.id]: {
+                ...partialData,
+                id: targetChap.id,
+                chapterId: targetChap.id,
+              },
+            }));
+          }
+        );
+      }
+      
+      // Clear streaming state after final doc is written
+      setStreamingChapters((prev) => {
+        const next = { ...prev };
+        delete next[targetChap.id];
+        return next;
+      });
+    } catch (e: any) {
       console.error(e);
       setGeneratingChapterIds((prev) => ({ ...prev, [chapId]: "failed" }));
+      if (e.name === 'BudgetExceededError') {
+        alert(e.message);
+      }
     }
   }
 
@@ -449,7 +913,21 @@ export default function BookViewer() {
     setChatInput("");
     setChatSelectionContext(null);
     setRightPane("ai");
+    
+    // Automatically close sidebar if expanded
+    if (isChatExpanded) {
+      setSidebarOpen(false);
+    }
+    
     await sendMessage(msg);
+  };
+
+  const toggleChatExpansion = () => {
+    const newState = !isChatExpanded;
+    setIsChatExpanded(newState);
+    if (newState) {
+      setSidebarOpen(false);
+    }
   };
 
   const wrapTextInMarkdown = async (
@@ -457,7 +935,7 @@ export default function BookViewer() {
     blockIdx: number | null,
     annoId: string,
   ) => {
-    if (blockIdx === null || blockIdx === -1 || !activeChapterData) return;
+    if (blockIdx === null || blockIdx === -1 || !activeChapterData || !activeChapterData.mainContent) return;
     const block = activeChapterData.mainContent[blockIdx];
     if (block && block.content && block.content.includes(text)) {
       const newContent = block.content.replace(
@@ -499,10 +977,11 @@ export default function BookViewer() {
     }
   };
 
-  const startHighlight = async (text: string, blockIdx: number | null) => {
+  const startHighlight = async (text: string, blockIdx: number | null, occurrence?: number) => {
     setIsSelectionBoxVisible(false);
     if (!activeChapterData) return;
     const newId = Date.now().toString();
+    const isInteractive = !!activeChapterData.componentCode;
     const newAnno: Annotation = {
       id: newId,
       type: "highlight",
@@ -510,18 +989,23 @@ export default function BookViewer() {
       color: "yellow",
       createdAt: Date.now(),
       chapterId: activeChapterData.id,
-      chapterTitle: activeChapterData.chapterId,
-      blockIdx,
+      chapterTitle: activeChapterData.chapterId || activeChapterId || "",
+      blockIdx: isInteractive ? null : blockIdx,
+      occurrence,
     };
     setAnnotations((prev) => [newAnno, ...prev]);
-    await wrapTextInMarkdown(text, blockIdx, newId);
     setActiveAnnotationId(newId);
+    
+    if (!isInteractive) {
+      wrapTextInMarkdown(text, blockIdx, newId);
+    }
   };
 
-  const startNote = async (text: string, blockIdx: number | null) => {
+  const startNote = async (text: string, blockIdx: number | null, occurrence?: number) => {
     setIsSelectionBoxVisible(false);
     if (!activeChapterData) return;
     const newId = Date.now().toString();
+    const isInteractive = !!activeChapterData.componentCode;
     const newAnno: Annotation = {
       id: newId,
       type: "note",
@@ -529,15 +1013,19 @@ export default function BookViewer() {
       color: "green",
       createdAt: Date.now(),
       chapterId: activeChapterData.id,
-      chapterTitle: activeChapterData.chapterId,
-      blockIdx,
+      chapterTitle: activeChapterData.chapterId || activeChapterId || "",
+      blockIdx: isInteractive ? null : blockIdx,
+      occurrence,
     };
     setAnnotations((prev) => [newAnno, ...prev]);
-    await wrapTextInMarkdown(text, blockIdx, newId);
     setRightPane("notes");
     setActiveAnnotationId(newId);
     setSelectedHighlightText(text);
     setShowNoteInput(true);
+    
+    if (!isInteractive) {
+      wrapTextInMarkdown(text, blockIdx, newId);
+    }
   };
 
   const removeAnnotation = async (anno: Annotation) => {
@@ -546,51 +1034,6 @@ export default function BookViewer() {
     if (activeAnnotationId === anno.id) {
       setActiveAnnotationId(null);
       setShowNoteInput(false);
-    }
-
-    // 2. Remove highlight from chapter content
-    if (anno.chapterId && anno.blockIdx !== null && anno.blockIdx !== -1) {
-      const target = `[${anno.text}](#anno-${anno.id})`;
-
-      // If we are currently editing THIS chapter, update the edit state too
-      if (isEditMode && activeChapterData?.id === anno.chapterId) {
-        const newEditedContent = [...editedMainContent];
-        const block = newEditedContent[anno.blockIdx];
-        if (block && block.content && block.content.includes(target)) {
-          newEditedContent[anno.blockIdx] = {
-            ...block,
-            content: block.content.replace(target, anno.text),
-          };
-          setEditedMainContent(newEditedContent);
-        }
-      }
-
-      try {
-        const chapterRef = doc(
-          db,
-          "courses",
-          courseId as string,
-          "chapters",
-          anno.chapterId,
-        );
-        const chapterSnap = await getDoc(chapterRef);
-        if (chapterSnap.exists()) {
-          const data = chapterSnap.data();
-          const newMainContent = [...(data.mainContent || [])];
-          const block = newMainContent[anno.blockIdx];
-          if (block && block.content) {
-            if (block.content.includes(target)) {
-              newMainContent[anno.blockIdx] = {
-                ...block,
-                content: block.content.replace(target, anno.text),
-              };
-              await updateDoc(chapterRef, { mainContent: newMainContent });
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Error removing annotation highlight:", err);
-      }
     }
   };
 
@@ -616,8 +1059,11 @@ Output ONLY the new rewritten paragraph. Use standard markdown.`;
       setEditedMainContent(newMainContent);
 
       setPersonalizeBlockIdx(null);
-    } catch (e) {
+    } catch (e: any) {
       console.error("error personalizing", e);
+      if (e.name === 'BudgetExceededError') {
+        alert(e.message);
+      }
     } finally {
       setIsPersonalizing(false);
     }
@@ -691,8 +1137,11 @@ Output ONLY the text content in markdown format. No headers if not specifically 
         setPromptingAddType(null);
         setAddCustomPrompt("");
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error("error adding block", e);
+      if (e.name === 'BudgetExceededError') {
+        alert(e.message);
+      }
     } finally {
       setAddingIdx(null);
       setIsGeneratingNewBlock(false);
@@ -816,8 +1265,11 @@ Output ONLY the text content in markdown format. No headers if not specifically 
       if (isEditMode) {
         setEditedMainContent(newMainContent);
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error("Failed to generate image", e);
+      if (e.name === 'BudgetExceededError') {
+        alert(e.message);
+      }
     } finally {
       setGeneratingImages((prev) => ({ ...prev, [idx]: false }));
     }
@@ -881,9 +1333,26 @@ Output ONLY the text content in markdown format. No headers if not specifically 
   const currentChapterIndex = flatOutlineChapters.findIndex(
     (c: any) => c.id === activeChapterId,
   );
+  const handleChapterChange = (id: string | undefined) => {
+    if (!id) return;
+    setActiveChapterId(id);
+    setSelectedVersionId(null);
+    setStreamingChapters({});
+    
+    // Reset generation config with defaults for this chapter
+    const chapterInOutline = course?.outline?.flatMap((p: any) => p.chapters).find((c: any) => c.id === id);
+    if (chapterInOutline) {
+      setGenConfig({
+        guidance: chapterInOutline.guidance || "",
+        tone: "conversational",
+        depth: "detailed",
+        focus: ""
+      });
+    }
+  };
   const totalChapters = flatOutlineChapters.length;
   const isGeneratingActive =
-    generatingChapterIds[activeChapterId as string] === "generating";
+    generatingChapterIds[activeChapterId as string] === "generating" && !streamingChapters[activeChapterId as string]?.mainContent?.length;
   const hasFailedActive =
     generatingChapterIds[activeChapterId as string] === "failed";
 
@@ -944,7 +1413,7 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                         return (
                           <li key={cIdx}>
                             <button
-                              onClick={() => setActiveChapterId(chap.id)}
+                              onClick={() => handleChapterChange(chap.id)}
                               title={chap.title}
                               className={`w-full flex items-center justify-between text-left px-3 py-2 rounded-xl text-sm transition-colors overflow-hidden ${
                                 isActive
@@ -990,67 +1459,104 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                 {course.title || course.topic || "Generating..."}
               </h1>
               {(course.authorName || (isCreator ? (user?.displayName || user?.email?.split('@')[0]) : null)) && (
-                <p className="text-[10px] text-gray-500 font-medium hidden sm:block truncate">
-                  by <span className="text-indigo-600 font-semibold">{course.authorName || (user?.displayName || user?.email?.split('@')[0])}</span>
-                </p>
+                <div className="flex items-center gap-2">
+                  <p className="text-[10px] text-gray-500 font-medium hidden sm:block truncate">
+                    by <span className="text-indigo-600 font-semibold">{course.authorName || (user?.displayName || user?.email?.split('@')[0])}</span>
+                  </p>
+                  {dbChaptersForActive.length > 1 && (
+                    <div className="flex items-center gap-1 text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold">
+                      <History className="w-2.5 h-2.5" />
+                      v{dbChaptersForActive.length - dbChaptersForActive.findIndex(c => c.id === dbChapter?.id)}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <div className="relative group/font">
-              <select
-                value={fontFamily}
-                onChange={(e) => setFontFamily(e.target.value)}
-                className="appearance-none text-sm bg-gray-50 border border-gray-200 rounded-xl pl-9 pr-10 py-2 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:outline-none text-gray-700 font-bold hover:bg-white hover:border-indigo-200 transition-all cursor-pointer shadow-sm"
-              >
-                <option value="font-sans">Sans Serif</option>
-                <option value="font-serif">Serif</option>
-                <option value="font-mono">Monospace</option>
-              </select>
-              <div className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400 group-hover/font:text-indigo-500 transition-colors">
-                <Type className="w-4 h-4" />
-              </div>
-              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
-                <ArrowUp className="w-3 h-3 rotate-180" />
-              </div>
-            </div>
-
-            <div className="h-6 w-[1px] bg-gray-200 mx-1 hidden sm:block"></div>
-
-            {isEditMode ? (
-              <div className="flex items-center gap-2 mr-2">
+            {dbChapter && isCreator && !showGenConfig && (
+              <div className="flex items-center bg-gray-50 rounded-xl p-1 border border-gray-100">
+                {dbChaptersForActive.length > 1 && (
+                  <select
+                    value={dbChapter.id}
+                    onChange={(e) => setSelectedVersionId(e.target.value)}
+                    className="bg-transparent border-none text-[11px] font-bold text-gray-600 focus:ring-0 cursor-pointer pr-6 py-1"
+                  >
+                    {dbChaptersForActive.map((v, idx) => (
+                      <option key={v.id} value={v.id}>
+                        Version {dbChaptersForActive.length - idx} ({new Date(v.createdAt?.seconds * 1000).toLocaleDateString()})
+                      </option>
+                    ))}
+                  </select>
+                )}
                 <button
-                  onClick={() => {
-                    setIsEditMode(false);
-                    setEditedMainContent([]);
-                    setPersonalizeBlockIdx(null);
-                  }}
-                  className="px-3 py-1.5 text-xs font-semibold text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+                  onClick={() => setShowGenConfig(true)}
+                  className="flex items-center gap-1.5 px-3 py-1 text-[11px] font-bold text-indigo-600 hover:bg-white rounded-lg transition-colors border border-transparent hover:border-indigo-100"
                 >
-                  Cancel
-                </button>
-                <button
-                  onClick={saveEdits}
-                  className="px-3 py-1.5 text-xs font-bold bg-indigo-600 text-white hover:bg-indigo-700 rounded-lg shadow-sm transition-colors"
-                >
-                  Save Edits
+                  <RotateCcw className="w-3 h-3" />
+                  Regenerate
                 </button>
               </div>
-            ) : isCreator ? (
-              <button
-                onClick={() => {
-                  setIsEditMode(true);
-                  setEditedMainContent([
-                    ...(activeChapterData?.mainContent || []),
-                  ]);
-                }}
-                className="p-2 mr-2 rounded-lg text-gray-500 hover:bg-gray-100 transition-colors flex items-center gap-1 text-sm font-medium"
-                title="Edit Chapter"
-              >
-                <PenTool className="w-4 h-4" />{" "}
-                <span className="hidden sm:inline">Edit</span>
-              </button>
-            ) : null}
+            )}
+
+            {!(activeChapterData?.moduleType === 'interactive' || activeChapterData?.componentCode) && (
+              <>
+                <div className="relative group/font">
+                  <select
+                    value={fontFamily}
+                    onChange={(e) => setFontFamily(e.target.value)}
+                    className="appearance-none text-sm bg-gray-50 border border-gray-200 rounded-xl pl-9 pr-10 py-2 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:outline-none text-gray-700 font-bold hover:bg-white hover:border-indigo-200 transition-all cursor-pointer shadow-sm"
+                  >
+                    <option value="font-sans">Sans Serif</option>
+                    <option value="font-serif">Serif</option>
+                    <option value="font-mono">Monospace</option>
+                  </select>
+                  <div className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400 group-hover/font:text-indigo-500 transition-colors">
+                    <Type className="w-4 h-4" />
+                  </div>
+                  <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
+                    <ArrowUp className="w-3 h-3 rotate-180" />
+                  </div>
+                </div>
+
+                <div className="h-6 w-[1px] bg-gray-200 mx-1 hidden sm:block"></div>
+
+                {isEditMode ? (
+                  <div className="flex items-center gap-2 mr-2">
+                    <button
+                      onClick={() => {
+                        setIsEditMode(false);
+                        setEditedMainContent([]);
+                        setPersonalizeBlockIdx(null);
+                      }}
+                      className="px-3 py-1.5 text-xs font-semibold text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={saveEdits}
+                      className="px-3 py-1.5 text-xs font-bold bg-indigo-600 text-white hover:bg-indigo-700 rounded-lg shadow-sm transition-colors"
+                    >
+                      Save Edits
+                    </button>
+                  </div>
+                ) : isCreator ? (
+                  <button
+                    onClick={() => {
+                      setIsEditMode(true);
+                      setEditedMainContent([
+                        ...(activeChapterData?.mainContent || []),
+                      ]);
+                    }}
+                    className="p-2 mr-2 rounded-lg text-gray-500 hover:bg-gray-100 transition-colors flex items-center gap-1 text-sm font-medium"
+                    title="Edit Chapter"
+                  >
+                    <PenTool className="w-4 h-4" />{" "}
+                    <span className="hidden sm:inline">Edit</span>
+                  </button>
+                ) : null}
+              </>
+            )}
 
             <button
               onClick={() => setRightPane(rightPane === "ai" ? null : "ai")}
@@ -1123,19 +1629,129 @@ Output ONLY the text content in markdown format. No headers if not specifically 
             className="flex-1 overflow-y-auto bg-white custom-scrollbar pb-32 scroll-smooth"
             onMouseUp={handleMouseUp}
           >
-            {activeChapterData ? (
+            {showGenConfig && isCreator && activeChapterId ? (
+               <div className="flex-1 overflow-y-auto custom-scrollbar bg-[#FCFCFD]">
+               <div className="max-w-2xl mx-auto p-4 py-12">
+                 <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                   <div className="flex items-center justify-between mb-8">
+                    <div className="w-16 h-16 bg-amber-50 rounded-2xl flex items-center justify-center text-amber-600">
+                      <RotateCcw className="w-8 h-8" />
+                    </div>
+                    <button 
+                      onClick={() => setShowGenConfig(false)}
+                      className="p-2 hover:bg-gray-100 rounded-xl text-gray-400"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                   </div>
+                   
+                   <div className="mb-8">
+                     <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                       Regenerate Chapter
+                     </h2>
+                     <p className="text-gray-500">
+                       Change the parameters below to create a new version of this chapter. Previous versions will be saved in history.
+                     </p>
+                   </div>
+
+                   <div className="space-y-6">
+                     <div>
+                       <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                         <Target className="w-4 h-4 text-indigo-500" /> Chapter Objective/Guidance
+                       </label>
+                       <textarea
+                         className="w-full bg-gray-50 border border-gray-200 rounded-xl p-4 text-sm focus:ring-2 focus:ring-indigo-500 min-h-[120px] focus:outline-none transition-all"
+                         value={genConfig.guidance}
+                         onChange={(e) => setGenConfig({ ...genConfig, guidance: e.target.value })}
+                         placeholder="What should this chapter cover? Key takeaways..."
+                       />
+                     </div>
+
+                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                       <div>
+                         <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                           <Sparkles className="w-4 h-4 text-pink-500" /> Tone
+                         </label>
+                         <select
+                           className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                           value={genConfig.tone}
+                           onChange={(e) => setGenConfig({ ...genConfig, tone: e.target.value })}
+                         >
+                           <option value="conversational">Conversational & Friendly</option>
+                           <option value="formal">Formal & Academic</option>
+                           <option value="technical">Technical & Detailed</option>
+                           <option value="humorous">Playful & Humorous</option>
+                         </select>
+                       </div>
+                       <div>
+                         <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                           <BookOpen className="w-4 h-4 text-emerald-500" /> Depth
+                         </label>
+                         <select
+                           className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                           value={genConfig.depth}
+                           onChange={(e) => setGenConfig({ ...genConfig, depth: e.target.value })}
+                         >
+                           <option value="introductory">Introductory (ELI5)</option>
+                           <option value="detailed">In-depth (Standard)</option>
+                           <option value="advanced">Advanced / Expert</option>
+                         </select>
+                       </div>
+                     </div>
+
+                     <div>
+                       <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                         <Zap className="w-4 h-4 text-amber-500" /> Specific Focus (Optional)
+                       </label>
+                       <input
+                         type="text"
+                         className="w-full bg-gray-50 border border-gray-200 rounded-xl p-4 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                         value={genConfig.focus}
+                         onChange={(e) => setGenConfig({ ...genConfig, focus: e.target.value })}
+                         placeholder="e.g. Focus specifically on Newtonian physics analogies"
+                       />
+                     </div>
+
+                     <button
+                       onClick={() => {
+                        setShowGenConfig(false);
+                        generateChapter(activeChapterId as string, genConfig);
+                       }}
+                       className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-bold shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-3 transform hover:-translate-y-0.5 active:translate-y-0"
+                     >
+                       <Zap className="w-5 h-5 fill-current" /> Create New Version
+                     </button>
+                   </div>
+                 </div>
+               </div>
+             </div>
+            ) : activeChapterData ? (
               <div
                 className={`max-w-4xl mx-auto px-6 py-12 lg:px-12 lg:py-16 h-full ${fontFamily}`}
               >
                 <h1 className="text-4xl lg:text-5xl font-bold text-gray-900 mb-10 leading-tight">
-                  {activeChapterData.chapterId
-                    .split("-")
-                    .map((s: string) => s.charAt(0).toUpperCase() + s.slice(1))
-                    .join(" ")}
+                  {displayTitle}
                 </h1>
 
-                <div className="space-y-8">
-                  {isEditMode && (
+                {activeChapterData.moduleType === 'interactive' || activeChapterData.componentCode ? (
+                  <div className="w-full">
+                    <InteractiveChapter 
+                      code={activeChapterData.componentCode} 
+                      annotations={annotations}
+                      activeChapterId={activeChapterData.id}
+                      activeAnnotationId={activeAnnotationId}
+                      onHighlightClick={(id, text, note) => {
+                        setRightPane("notes");
+                        setActiveAnnotationId(id);
+                        setSelectedHighlightText(text);
+                        setNoteInput(note);
+                        setShowNoteInput(true);
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    {isEditMode && (
                     <div className="flex items-center justify-center -mt-6 mb-8 flex-col gap-4">
                       <div className="bg-white border border-gray-200 shadow-sm rounded-full px-3 py-1.5 flex items-center gap-1">
                         {addingIdx === -1 && isGeneratingNewBlock ? (
@@ -1267,6 +1883,14 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                         </div>
                       );
                     } else {
+                      let displayContent = block.content || "";
+                      const chapterAnnos = annotations.filter(a => a.chapterId === activeChapterData.id && a.blockIdx === idx);
+                      chapterAnnos.forEach(anno => {
+                          if (anno.text && displayContent.includes(anno.text) && !displayContent.includes(`](#anno-${anno.id})`)) {
+                              displayContent = displayContent.replace(anno.text, `[${anno.text}](#anno-${anno.id})`);
+                          }
+                      });
+                      
                       blockContent = (
                         <div
                           className="text-gray-800 leading-8"
@@ -1330,7 +1954,7 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                               },
                             }}
                           >
-                            {block.content}
+                            {displayContent}
                           </Markdown>
                         </div>
                       );
@@ -1479,12 +2103,13 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                     );
                   })}
                 </div>
+                )}
 
                 <div className="mt-20 pt-8 border-t border-gray-100 flex items-center justify-between">
                   <button
                     disabled={currentChapterIndex <= 0}
                     onClick={() =>
-                      setActiveChapterId(
+                      handleChapterChange(
                         flatOutlineChapters[currentChapterIndex - 1]?.id,
                       )
                     }
@@ -1510,7 +2135,7 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                   <button
                     disabled={currentChapterIndex >= totalChapters - 1}
                     onClick={() =>
-                      setActiveChapterId(
+                      handleChapterChange(
                         flatOutlineChapters[currentChapterIndex + 1]?.id,
                       )
                     }
@@ -1541,80 +2166,186 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                   Try Again
                 </button>
               </div>
-            ) : chaptersLoaded ? (
-              <div className="flex items-center justify-center h-full p-8 flex-col gap-6 text-center max-w-md mx-auto">
-                <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center text-gray-400 mb-2">
-                  <FileText className="w-8 h-8" />
+            ) : (chaptersLoaded && activeChapterId && course?.outline) ? (
+              <div className="flex-1 overflow-y-auto custom-scrollbar">
+                <div className="max-w-2xl mx-auto p-8 pt-12">
+                  <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                    <div className="w-16 h-16 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-600 mb-6">
+                      <PenTool className="w-8 h-8" />
+                    </div>
+                    
+                    <div className="mb-8">
+                      <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Draft Your Chapter
+                      </h2>
+                      <p className="text-gray-500">
+                        {chapterInOutline?.title} is ready to be generated. Fine-tune these parameters to get the perfect version.
+                      </p>
+                    </div>
+
+                    <div className="space-y-6">
+                      <div>
+                        <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                          <Target className="w-4 h-4 text-indigo-500" /> Chapter Objective/Guidance
+                        </label>
+                        <textarea
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl p-4 text-sm focus:ring-2 focus:ring-indigo-500 min-h-[120px] focus:outline-none transition-all"
+                          value={genConfig.guidance}
+                          onChange={(e) => setGenConfig({ ...genConfig, guidance: e.target.value })}
+                          placeholder="What should this chapter cover? Key takeaways..."
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                            <Sparkles className="w-4 h-4 text-pink-500" /> Tone
+                          </label>
+                          <select
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                            value={genConfig.tone}
+                            onChange={(e) => setGenConfig({ ...genConfig, tone: e.target.value })}
+                          >
+                            <option value="conversational">Conversational & Friendly</option>
+                            <option value="formal">Formal & Academic</option>
+                            <option value="technical">Technical & Detailed</option>
+                            <option value="humorous">Playful & Humorous</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                            <BookOpen className="w-4 h-4 text-emerald-500" /> Depth
+                          </label>
+                          <select
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                            value={genConfig.depth}
+                            onChange={(e) => setGenConfig({ ...genConfig, depth: e.target.value })}
+                          >
+                            <option value="introductory">Introductory (ELI5)</option>
+                            <option value="detailed">In-depth (Standard)</option>
+                            <option value="advanced">Advanced / Expert</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                          <Zap className="w-4 h-4 text-amber-500" /> Specific Focus (Optional)
+                        </label>
+                        <input
+                          type="text"
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl p-4 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                          value={genConfig.focus}
+                          onChange={(e) => setGenConfig({ ...genConfig, focus: e.target.value })}
+                          placeholder="e.g. Focus specifically on Newtonian physics analogies"
+                        />
+                      </div>
+
+                      <button
+                        onClick={() => generateChapter(activeChapterId as string, genConfig)}
+                        className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-bold shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-3 transform hover:-translate-y-0.5 active:translate-y-0"
+                      >
+                        <Zap className="w-5 h-5 fill-current" /> Generate This Chapter
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <h2 className="text-xl font-bold text-gray-900 mb-2">
-                    Chapter Not Generated
-                  </h2>
-                  <p className="text-gray-500 text-sm">
-                    This chapter hasn't been generated yet. Click the button
-                    below to have AI create the content and interactive
-                    exercises for this section.
-                  </p>
-                </div>
-                <button
-                  onClick={() => generateChapter(activeChapterId as string)}
-                  className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold shadow-sm transition-colors flex items-center gap-2"
-                >
-                  <PenTool className="w-4 h-4" /> Generate Chapter
-                </button>
               </div>
             ) : (
-              <div className="flex items-center justify-center h-full text-gray-400">
-                Loading chapter content...
+              <div className="flex items-center justify-center h-full text-gray-400 flex-col gap-4">
+                <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
+                <p className="text-sm font-medium">Loading chapter content...</p>
               </div>
             )}
           </main>
 
           {rightPane && (
-            <aside className="w-80 bg-white border-l border-gray-200 flex flex-col shrink-0 custom-scrollbar shadow-sm z-20">
-              <div className="h-14 border-b border-gray-200 flex items-center justify-between px-3 shrink-0 bg-gray-50/50">
-                <div className="flex items-center w-full min-w-0 pr-2">
+            <aside className={`${rightPane === "ai" && isChatExpanded ? "w-[500px]" : "w-80"} transition-all duration-300 bg-white border-l border-gray-200 flex flex-col shrink-0 custom-scrollbar shadow-sm z-20`}>
+              <div 
+                className="h-14 border-b border-gray-200 flex items-center justify-between px-3 shrink-0 bg-gray-50/50 relative"
+                onMouseEnter={() => setIsHeaderHovered(true)}
+                onMouseLeave={() => setIsHeaderHovered(false)}
+              >
+                <div className="flex items-center w-full min-w-0">
                   {rightPane === "ai" ? (
                     <>
-                      <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mr-2" />
+                      <div className="shrink-0 mr-2 flex items-center justify-center w-6 h-6">
+                        {isHeaderHovered ? (
+                          <button
+                            onClick={toggleChatExpansion}
+                            className="p-1 text-gray-400 hover:text-indigo-600 hover:bg-white rounded transition-colors"
+                            title={isChatExpanded ? "Shrink Chat" : "Expand Chat"}
+                          >
+                            {isChatExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                          </button>
+                        ) : (
+                          <Sparkles className="w-4 h-4 text-indigo-500" />
+                        )}
+                      </div>
+                      
                       {chatSessions.length > 0 ? (
-                        <div className="flex items-center justify-between w-full min-w-0">
-                          <div className="flex-1 min-w-0 mr-2">
-                            <select
-                              className="w-full bg-transparent border-none text-sm font-bold text-gray-900 p-0 focus:ring-0 cursor-pointer truncate"
-                              value={activeSessionId || ""}
-                              onChange={(e) =>
-                                setActiveSessionId(e.target.value)
-                              }
-                            >
-                              {chatSessions.map((s) => (
-                                <option key={s.id} value={s.id}>
-                                  {s.title}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                          <div className="flex items-center shrink-0 space-x-0.5">
-                            <button
-                              onClick={() => createNewSession()}
-                              className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
-                              title="New Chat"
-                            >
-                              <Plus className="w-4 h-4" />
-                            </button>
-                            {activeSessionId && (
-                              <button
-                                onClick={() => deleteSession(activeSessionId)}
-                                className="p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
-                                title="Delete session"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            )}
-                          </div>
+                        <div className="flex-1 min-w-0 relative">
+                          <button
+                            onClick={() => setIsChatMenuOpen(!isChatMenuOpen)}
+                            className="w-full flex items-center justify-between bg-transparent border-none text-sm font-bold text-gray-900 p-1.5 hover:bg-white/50 rounded-lg transition-colors cursor-pointer text-left group"
+                          >
+                            <span className="truncate flex-1">
+                              {chatSessions.find(s => s.id === activeSessionId)?.title || "Select Chat"}
+                            </span>
+                            <Plus className={`w-3.5 h-3.5 text-gray-400 ml-1 transition-transform ${isChatMenuOpen ? 'rotate-45' : ''}`} />
+                          </button>
+
+                          {isChatMenuOpen && (
+                            <>
+                              <div 
+                                className="fixed inset-0 z-30" 
+                                onClick={() => setIsChatMenuOpen(false)} 
+                              />
+                              <div className="absolute top-full left-0 mt-1 w-full min-w-[200px] bg-white border border-gray-200 rounded-xl shadow-xl z-40 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-100">
+                                <button
+                                  onClick={() => {
+                                    createNewSession();
+                                    setIsChatMenuOpen(false);
+                                  }}
+                                  className="w-full flex items-center gap-2 px-3 py-2 text-sm font-bold text-indigo-600 hover:bg-indigo-50 transition-colors border-b border-gray-100"
+                                >
+                                  <Plus className="w-4 h-4" /> New Chat
+                                </button>
+                                <div className="max-h-[300px] overflow-y-auto custom-scrollbar">
+                                  {chatSessions.map((s) => (
+                                    <div
+                                      key={s.id}
+                                      className={`group/item flex items-center justify-between px-3 py-2 text-sm cursor-pointer transition-colors ${
+                                        activeSessionId === s.id 
+                                          ? "bg-indigo-50 text-indigo-700 font-semibold" 
+                                          : "text-gray-700 hover:bg-gray-100"
+                                      }`}
+                                      onClick={() => {
+                                        setActiveSessionId(s.id);
+                                        setIsChatMenuOpen(false);
+                                      }}
+                                    >
+                                      <span className="truncate flex-1 mr-2">{s.title}</span>
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          deleteSession(s.id);
+                                          if (activeSessionId === s.id) setIsChatMenuOpen(false);
+                                        }}
+                                        className="opacity-0 group-hover/item:opacity-100 p-1 text-gray-400 hover:text-rose-500 hover:bg-rose-50 rounded transition-all"
+                                        title="Delete chat"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            </>
+                          )}
                         </div>
                       ) : (
-                        <div className="flex items-center justify-between w-full min-w-0">
+                        <div className="flex-1 min-w-0 flex items-center justify-between">
                           <h3 className="font-bold text-gray-900 truncate">
                             Ask AI
                           </h3>
@@ -1674,24 +2405,37 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                         </p>
                       </div>
                     ) : (
-                      activeChatSession.messages.map((msg, i) => (
-                        <div
-                          key={msg.id || i}
-                          className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
-                        >
+                      <>
+                        {activeChatSession.messages.map((msg, i) => (
                           <div
-                            className={`p-3 rounded-2xl max-w-[90%] text-[13px] leading-relaxed ${
-                              msg.role === "user"
-                                ? "bg-indigo-600 text-white rounded-br-sm"
-                                : "bg-gray-100 text-gray-800 rounded-bl-sm"
-                            }`}
+                            key={msg.id || i}
+                            className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
                           >
-                            <Markdown>{msg.text}</Markdown>
+                            <div
+                              className={`p-3 rounded-2xl max-w-[90%] text-[13px] leading-relaxed ${
+                                msg.role === "user"
+                                  ? "bg-indigo-600 text-white rounded-br-sm"
+                                  : "bg-gray-100 text-gray-800 rounded-bl-sm"
+                              }`}
+                            >
+                              <div className={msg.role === "user" ? "text-inherit" : "markdown-body text-sm font-sans bg-transparent p-0 leading-relaxed max-w-none text-inherit"}>
+                                <Markdown>{msg.text}</Markdown>
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      ))
+                        ))}
+                        {isChatLoading && streamingMessageText && (
+                          <div className={`flex flex-col items-start`}>
+                            <div className={`p-3 rounded-2xl max-w-[90%] text-[13px] leading-relaxed bg-gray-100 text-gray-800 rounded-bl-sm`}>
+                              <div className="markdown-body text-sm font-sans bg-transparent p-0 leading-relaxed max-w-none text-inherit">
+                                <Markdown>{streamingMessageText}</Markdown>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </>
                     )}
-                    {isChatLoading && (
+                    {isChatLoading && !streamingMessageText && (
                       <div className="flex items-center gap-2 text-indigo-500 text-xs font-medium">
                         <Loader2 className="w-3.5 h-3.5 animate-spin" /> AI is
                         thinking...
@@ -2028,14 +2772,14 @@ Output ONLY the text content in markdown format. No headers if not specifically 
               <div className="w-[1px] h-5 bg-gray-700 mx-0.5"></div>
               <button
                 className="px-2 py-1.5 hover:bg-gray-800 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap disabled:opacity-50"
-                onClick={() => startNote(selectionBox.text, selectionBox.blockIdx)}
+                onClick={() => startNote(selectionBox.text, selectionBox.blockIdx, selectionBox.occurrence)}
               >
                 <FileText className="w-3.5 h-3.5 text-emerald-400" /> Note
               </button>
               <div className="w-[1px] h-5 bg-gray-700 mx-0.5"></div>
               <button
                 className="px-2 py-1.5 hover:bg-gray-800 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap disabled:opacity-50"
-                onClick={() => startHighlight(selectionBox.text, selectionBox.blockIdx)}
+                onClick={() => startHighlight(selectionBox.text, selectionBox.blockIdx, selectionBox.occurrence)}
               >
                 <Highlighter className="w-3.5 h-3.5 text-yellow-400" /> Highlight
               </button>
