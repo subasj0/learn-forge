@@ -4,11 +4,7 @@ import { db } from "../../lib/firebase";
 import { useAuth } from "../../lib/auth";
 import {
   doc,
-  getDoc,
-  collection,
-  query,
   onSnapshot,
-  where,
   updateDoc,
 } from "firebase/firestore";
 import { handleFirestoreError, OperationType } from "../../lib/firestoreUtils";
@@ -44,14 +40,8 @@ import {
   RotateCcw
 } from "lucide-react";
 import localforage from "localforage";
-import {
-  generateCourseOutline,
-  generateChapterContent,
-  chatWithChapter,
-} from "../../lib/agents/courseGenerator";
-import { generateInteractiveChapter } from "../../lib/agents/interactiveAgent";
-import { fetchJson } from "../../lib/storage";
 import { useAIChat } from "../../hooks/useAIChat";
+import { completeChat, fetchChapterContent, generateChapter as generateChapterApi } from "../../lib/api";
 import { Runner } from "react-runner";
 import * as LucideIcons from "lucide-react";
 import * as Motion from "motion/react";
@@ -61,6 +51,23 @@ import { twMerge } from "tailwind-merge";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+function getChapterRef(course: any, chapterId: string | null) {
+  if (!course || !chapterId) return null;
+  return course.chapterRefs?.[chapterId] || null;
+}
+
+function getChapterVersions(course: any, chapterId: string | null) {
+  const chapterRef = getChapterRef(course, chapterId);
+  if (!chapterRef?.versions?.length) return [];
+  return [...chapterRef.versions]
+    .map((version: any) => ({
+      ...version,
+      id: version.versionId,
+      chapterId,
+    }))
+    .sort((a: any, b: any) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
 }
 
 class InteractiveErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean; error: any }> {
@@ -396,14 +403,9 @@ export default function BookViewer() {
   const { user, openLoginModal } = useAuth();
   const { courseId } = useParams();
   const [course, setCourse] = useState<any>(null);
-  const [chapters, setChapters] = useState<any[]>([]);
-  const [chaptersLoaded, setChaptersLoaded] = useState(false);
   const [activeChapterId, setActiveChapterId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [generatingChapterIds, setGeneratingChapterIds] = useState<
-    Record<string, "generating" | "failed">
-  >({});
-  const [streamingChapters, setStreamingChapters] = useState<Record<string, any>>({});
+  const [localGeneratingChapterIds, setLocalGeneratingChapterIds] = useState<Record<string, boolean>>({});
 
   // Generation configuration state
   const [genConfig, setGenConfig] = useState({
@@ -442,39 +444,34 @@ export default function BookViewer() {
   const [addCustomPrompt, setAddCustomPrompt] = useState<string>("");
   const [isGeneratingNewBlock, setIsGeneratingNewBlock] = useState(false);
 
-  const [externalContent, setExternalContent] = useState<Record<string, any>>({});
+  const [chapterContent, setChapterContent] = useState<Record<string, any>>({});
   const [loadingExternal, setLoadingExternal] = useState<Record<string, boolean>>({});
 
   const dbChaptersForActive = React.useMemo(() => {
-    if (!chapters || !activeChapterId) return [];
-    return chapters.filter((c) => c.chapterId === activeChapterId || c.id === activeChapterId)
-      .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-  }, [chapters, activeChapterId]);
+    return getChapterVersions(course, activeChapterId);
+  }, [course, activeChapterId]);
 
   const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
 
   const dbChapter = React.useMemo(() => {
     if (!dbChaptersForActive.length) return null;
     if (selectedVersionId) {
-      return dbChaptersForActive.find(c => c.id === selectedVersionId) || dbChaptersForActive[0];
+      return dbChaptersForActive.find(c => c.versionId === selectedVersionId) || dbChaptersForActive[0];
     }
-    return dbChaptersForActive[0];
-  }, [dbChaptersForActive, selectedVersionId]);
+    const latestVersionId = getChapterRef(course, activeChapterId)?.latestVersionId;
+    return dbChaptersForActive.find(c => c.versionId === latestVersionId) || dbChaptersForActive[0];
+  }, [course, activeChapterId, dbChaptersForActive, selectedVersionId]);
 
   const activeChapterData = React.useMemo(() => {
-    if (!activeChapterId) return null;
-    
-    const streaming = streamingChapters[activeChapterId];
-    if (streaming) return streaming;
-    
-    if (!dbChapter) return null;
-    
-    const extContent = externalContent[dbChapter.id];
+    if (!activeChapterId || !dbChapter) return null;
+
+    const extContent = chapterContent[dbChapter.versionId];
+    if (!extContent) return null;
     return {
       ...dbChapter,
-      ...(extContent ? (typeof extContent === 'object' ? extContent : { componentCode: extContent }) : {})
+      ...(typeof extContent === 'object' ? extContent : { componentCode: extContent })
     };
-  }, [streamingChapters, activeChapterId, dbChapter, externalContent]);
+  }, [activeChapterId, dbChapter, chapterContent]);
 
   const chapterInOutline = course?.outline?.flatMap((p: any) => p.chapters).find((c: any) => c.id === activeChapterId);
   const displayTitle = chapterInOutline?.title || (activeChapterData?.chapterId || activeChapterId || "")
@@ -582,54 +579,22 @@ export default function BookViewer() {
 
   useEffect(() => {
     async function loadExternal() {
-      if (!activeChapterId || streamingChapters[activeChapterId]) return;
-      
+      if (!activeChapterId || !courseId) return;
       const chap = dbChapter;
-      if (chap && chap.contentUrl && !externalContent[chap.id] && !loadingExternal[chap.id]) {
-        setLoadingExternal(prev => ({ ...prev, [chap.id]: true }));
+      if (chap?.versionId && !chapterContent[chap.versionId] && !loadingExternal[chap.versionId]) {
+        setLoadingExternal(prev => ({ ...prev, [chap.versionId]: true }));
         try {
-          console.log(`Loading content for version ${chap.id}...`);
-          const resp = await fetch(chap.contentUrl);
-          if (resp.ok) {
-            const data = await resp.json();
-            setExternalContent(prev => ({ ...prev, [chap.id]: data }));
-          }
+          const data = await fetchChapterContent(courseId, activeChapterId, chap.versionId);
+          setChapterContent(prev => ({ ...prev, [chap.versionId]: data }));
         } catch (err) {
           console.error("Failed to load external content", err);
         } finally {
-          setLoadingExternal(prev => ({ ...prev, [chap.id]: false }));
+          setLoadingExternal(prev => ({ ...prev, [chap.versionId]: false }));
         }
       }
     }
     loadExternal();
-  }, [activeChapterId, dbChapter, chapters, streamingChapters, externalContent, loadingExternal]);
-
-  useEffect(() => {
-    async function generateTOC() {
-      if (
-        !courseId ||
-        !course ||
-        isGeneratingOutline ||
-        course.status !== "draft_outline"
-      )
-        return;
-      setIsGeneratingOutline(true);
-      try {
-        const files = await localforage.getItem<any[]>(
-          `course_files_${courseId}`,
-        );
-        await generateCourseOutline(courseId, course.topic, files || undefined, course.moduleType, course.personalization);
-      } catch (err: any) {
-        console.error("error generating TOC", err);
-        if (err.name === 'BudgetExceededError') {
-          alert(err.message);
-        }
-      } finally {
-        setIsGeneratingOutline(false);
-      }
-    }
-    generateTOC();
-  }, [course?.status, courseId]);
+  }, [activeChapterId, courseId, dbChapter, chapterContent, loadingExternal]);
 
   useEffect(() => {
     async function loadNotes() {
@@ -739,7 +704,6 @@ export default function BookViewer() {
   }, [course, activeChapterId]);
 
   useEffect(() => {
-    let unsubscribeChapters: any;
     let unsubscribeCourse: any;
 
     async function loadData() {
@@ -755,25 +719,10 @@ export default function BookViewer() {
         },
         (err) => handleFirestoreError(err, OperationType.GET, `courses/${courseId}`)
       );
-
-      try {
-        const chaptersRef = collection(db, "courses", courseId, "chapters");
-        unsubscribeChapters = onSnapshot(chaptersRef, (snapshot) => {
-          const chaps = snapshot.docs.map(
-            (d) => ({ id: d.id, ...d.data() }) as any,
-          );
-          chaps.sort((a, b) => (a.order || 0) - (b.order || 0));
-          setChapters(chaps);
-          setChaptersLoaded(true);
-        }, (err) => handleFirestoreError(err, OperationType.LIST, `courses/${courseId}/chapters`));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.LIST, `courses/${courseId}/chapters`);
-      }
     }
 
     loadData();
     return () => {
-      if (unsubscribeChapters) unsubscribeChapters();
       if (unsubscribeCourse) unsubscribeCourse();
     };
   }, [courseId, user]);
@@ -792,110 +741,37 @@ export default function BookViewer() {
 
   async function generateChapter(chapId: string, customConfig?: typeof genConfig) {
     if (!courseId || !user || !course) return;
-    setGeneratingChapterIds((prev) => ({ ...prev, [chapId]: "generating" }));
-
-    let targetChap = null;
-    let targetPart = null;
-    let orderIndex = 0;
-    for (const part of course.outline || []) {
-      for (const chap of part.chapters || []) {
-        if (chap.id === chapId) {
-          targetChap = chap;
-          targetPart = part;
-          break;
-        }
-        orderIndex++;
-      }
-      if (targetChap) break;
-    }
-
-    if (!targetChap) {
-      setGeneratingChapterIds((prev) => ({ ...prev, [chapId]: "failed" }));
-      return;
-    }
-
-    // Merge personalization with custom config
-    const mergedPersonalization = {
-      ...course.personalization,
-      ...(customConfig ? {
-        customGuidance: customConfig.guidance,
-        tone: customConfig.tone,
-        depth: customConfig.depth,
-        focus: customConfig.focus
-      } : {})
-    };
+    setLocalGeneratingChapterIds((prev) => ({ ...prev, [chapId]: true }));
 
     try {
-      const files = await localforage.getItem<any[]>(
-        `course_files_${courseId}`,
-      );
-
-      if (course.moduleType === 'interactive') {
-        await generateInteractiveChapter(
-          courseId,
-          {
-            id: targetChap.id,
-            title: targetChap.title,
-            partTitle: targetPart.title,
-            guidance: customConfig?.guidance || targetChap.guidance,
-          },
-          course.topic,
-          orderIndex,
-          user.uid,
-          files || undefined,
-          mergedPersonalization,
-          (partialData) => {
-            setStreamingChapters((prev) => ({
-              ...prev,
-              [targetChap.id]: {
-                ...partialData,
-                id: targetChap.id,
-                chapterId: targetChap.id,
-              },
-            }));
-          }
-        );
-      } else {
-        await generateChapterContent(
-          courseId,
-          {
-            id: targetChap.id,
-            title: targetChap.title,
-            partTitle: targetPart.title,
-            guidance: customConfig?.guidance || targetChap.guidance,
-          },
-          course.topic,
-          orderIndex,
-          user.uid,
-          files || undefined,
-          course.moduleType,
-          mergedPersonalization,
-          (partialData) => {
-            setStreamingChapters((prev) => ({
-              ...prev,
-              [targetChap.id]: {
-                ...partialData,
-                id: targetChap.id,
-                chapterId: targetChap.id,
-              },
-            }));
-          }
-        );
-      }
-      
-      // Clear streaming state after final doc is written
-      setStreamingChapters((prev) => {
-        const next = { ...prev };
-        delete next[targetChap.id];
-        return next;
+      const files = await localforage.getItem<any[]>(`course_files_${courseId}`);
+      await generateChapterApi({
+        courseId,
+        chapterId: chapId,
+        generationConfig: customConfig || genConfig,
+        files: files || [],
       });
+      setSelectedVersionId(null);
+      setShowGenConfig(false);
     } catch (e: any) {
       console.error(e);
-      setGeneratingChapterIds((prev) => ({ ...prev, [chapId]: "failed" }));
-      if (e.name === 'BudgetExceededError') {
-        alert(e.message);
-      }
+      alert(e.message || "Failed to generate chapter");
+    } finally {
+      setLocalGeneratingChapterIds((prev) => {
+        const next = { ...prev };
+        delete next[chapId];
+        return next;
+      });
     }
+  }
+
+  async function completeTextPrompt(prompt: string) {
+    const { text } = await completeChat({
+      chapterText: chapterTextContext,
+      message: prompt,
+      history: [],
+    });
+    return text;
   }
 
   const handleSendChat = async (
@@ -958,21 +834,14 @@ export default function BookViewer() {
         }
       }
 
-      try {
-        await updateDoc(
-          doc(
-            db,
-            "courses",
-            courseId as string,
-            "chapters",
-            activeChapterData.id,
-          ),
-          {
+      if (activeChapterData.versionId) {
+        setChapterContent((prev) => ({
+          ...prev,
+          [activeChapterData.versionId]: {
+            ...(prev[activeChapterData.versionId] || activeChapterData),
             mainContent: newMainContent,
           },
-        );
-      } catch (e) {
-        console.error("Failed to wrap text", e);
+        }));
       }
     }
   };
@@ -988,7 +857,7 @@ export default function BookViewer() {
       text,
       color: "yellow",
       createdAt: Date.now(),
-      chapterId: activeChapterData.id,
+      chapterId: activeChapterId || activeChapterData.chapterId,
       chapterTitle: activeChapterData.chapterId || activeChapterId || "",
       blockIdx: isInteractive ? null : blockIdx,
       occurrence,
@@ -1012,7 +881,7 @@ export default function BookViewer() {
       text,
       color: "green",
       createdAt: Date.now(),
-      chapterId: activeChapterData.id,
+      chapterId: activeChapterId || activeChapterData.chapterId,
       chapterTitle: activeChapterData.chapterId || activeChapterId || "",
       blockIdx: isInteractive ? null : blockIdx,
       occurrence,
@@ -1052,7 +921,7 @@ ${personalizePrompt}
 
 Output ONLY the new rewritten paragraph. Use standard markdown.`;
 
-      const newContent = await chatWithChapter("", sysMsg, []);
+      const newContent = await completeTextPrompt(sysMsg);
 
       const newMainContent = [...editedMainContent];
       newMainContent[idx] = { ...block, content: newContent };
@@ -1102,7 +971,7 @@ User's specific instruction/prompt for this new section:
 
 Output ONLY the text content in markdown format. No headers if not specifically asked.`;
 
-        const res = await chatWithChapter("", sysMsg, []);
+        const res = await completeTextPrompt(sysMsg);
         newBlock = { type: "markdown", content: res.trim() };
       } else {
         const contextBlocks = (
@@ -1114,11 +983,11 @@ Output ONLY the text content in markdown format. No headers if not specifically 
 
         if (type === "flashcard") {
           const sysMsg = `Generate a JSON flashcard based on this context:\n${context}\n\n${customUserPrompt ? `User request: ${customUserPrompt}\n\n` : ""}Format exactly like this example:\n{"type":"flashcard","content":"Question?","backContent":"Answer."}\nOnly output the JSON object, no markdown.`;
-          const res = await chatWithChapter("", sysMsg, []);
+          const res = await completeTextPrompt(sysMsg);
           newBlock = JSON.parse(res.replace(/```json|```/g, "").trim());
         } else if (type === "image") {
           const sysMsg = `Generate a detailed image generation prompt for an illustration related to this context:\n${context}\n\n${customUserPrompt ? `User request for the image: ${customUserPrompt}\n\n` : ""}Just output the prompt text, no markdown.`;
-          const prompt = (await chatWithChapter("", sysMsg, []))
+          const prompt = (await completeTextPrompt(sysMsg))
             .replace(/```/g, "")
             .trim();
           newBlock = {
@@ -1208,12 +1077,15 @@ Output ONLY the text content in markdown format. No headers if not specifically 
   const saveEdits = async () => {
     if (!activeChapterData || !courseId) return;
     try {
-      await updateDoc(
-        doc(db, "courses", courseId, "chapters", activeChapterData.id),
-        {
-          mainContent: editedMainContent,
-        },
-      );
+      if (activeChapterData.versionId) {
+        setChapterContent((prev) => ({
+          ...prev,
+          [activeChapterData.versionId]: {
+            ...(prev[activeChapterData.versionId] || activeChapterData),
+            mainContent: editedMainContent,
+          },
+        }));
+      }
       setIsEditMode(false);
       setPersonalizeBlockIdx(null);
     } catch (e) {
@@ -1234,14 +1106,14 @@ Output ONLY the text content in markdown format. No headers if not specifically 
       const block = activeChapterData.mainContent[idx];
       const rawPrompt = block.content;
 
-      // Use a "lighter model" (Flash is already used by chatWithChapter) to refine it
+      // Ask the server-side chat agent to refine it.
       const systemPrompt = `You are an expert image prompt engineer.
       Refine the following educational illustration description into a highly detailed, professional prompt for an image generator (like DALL-E or Midjourney).
       Original Description: ${rawPrompt}
       
       Output ONLY the refined prompt text, no markdown, no quotes. Keep it around 50-70 words. Mention it should be high quality, educational, and clean.`;
 
-      const refinedPrompt = await chatWithChapter("", systemPrompt, []);
+      const refinedPrompt = await completeTextPrompt(systemPrompt);
 
       // Using pollinators as a reliable runtime image generator
       const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(refinedPrompt.trim())}?width=1024&height=576&nologo=true&seed=${Math.floor(Math.random() * 1000000)}`;
@@ -1255,12 +1127,15 @@ Output ONLY the text content in markdown format. No headers if not specifically 
           rawPrompt.substring(0, 100) + (rawPrompt.length > 100 ? "..." : ""),
       };
 
-      await updateDoc(
-        doc(db, "courses", courseId, "chapters", activeChapterData.id),
-        {
-          mainContent: newMainContent,
-        },
-      );
+      if (activeChapterData.versionId) {
+        setChapterContent((prev) => ({
+          ...prev,
+          [activeChapterData.versionId]: {
+            ...(prev[activeChapterData.versionId] || activeChapterData),
+            mainContent: newMainContent,
+          },
+        }));
+      }
 
       if (isEditMode) {
         setEditedMainContent(newMainContent);
@@ -1300,8 +1175,8 @@ Output ONLY the text content in markdown format. No headers if not specifically 
             note: noteInput.trim(),
             color: "green",
             createdAt: Date.now(),
-            chapterId: activeChapterData?.id,
-            chapterTitle: activeChapterData?.chapterId,
+            chapterId: activeChapterId || activeChapterData?.chapterId,
+            chapterTitle: activeChapterId || activeChapterData?.chapterId,
             blockIdx: null,
           },
           ...prev,
@@ -1337,7 +1212,6 @@ Output ONLY the text content in markdown format. No headers if not specifically 
     if (!id) return;
     setActiveChapterId(id);
     setSelectedVersionId(null);
-    setStreamingChapters({});
     
     // Reset generation config with defaults for this chapter
     const chapterInOutline = course?.outline?.flatMap((p: any) => p.chapters).find((c: any) => c.id === id);
@@ -1351,12 +1225,13 @@ Output ONLY the text content in markdown format. No headers if not specifically 
     }
   };
   const totalChapters = flatOutlineChapters.length;
+  const activeChapterRef = getChapterRef(course, activeChapterId);
   const isGeneratingActive =
-    generatingChapterIds[activeChapterId as string] === "generating" && !streamingChapters[activeChapterId as string]?.mainContent?.length;
+    activeChapterRef?.generationStatus === "generating" || localGeneratingChapterIds[activeChapterId as string] === true;
   const hasFailedActive =
-    generatingChapterIds[activeChapterId as string] === "failed";
+    activeChapterRef?.generationStatus === "failed";
 
-  if (course.status === "draft_outline") {
+  if (course.status === "generating_outline") {
     return (
       <div className="flex flex-col h-screen bg-gray-50 w-full overflow-hidden font-sans items-center justify-center">
         <Loader2 className="w-10 h-10 animate-spin text-indigo-600 mb-4" />
@@ -1405,11 +1280,10 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                     <ul className="space-y-1">
                       {(part.chapters || []).map((chap: any, cIdx: number) => {
                         const isActive = activeChapterId === chap.id;
-                        const isGenerated = chapters.some(
-                          (c) => c.chapterId === chap.id,
-                        );
+                        const chapterRef = getChapterRef(course, chap.id);
+                        const isGenerated = chapterRef?.generationStatus === "ready";
                         const isGenerating =
-                          generatingChapterIds[chap.id] === "generating";
+                          chapterRef?.generationStatus === "generating" || localGeneratingChapterIds[chap.id] === true;
                         return (
                           <li key={cIdx}>
                             <button
@@ -1478,13 +1352,13 @@ Output ONLY the text content in markdown format. No headers if not specifically 
               <div className="flex items-center bg-gray-50 rounded-xl p-1 border border-gray-100">
                 {dbChaptersForActive.length > 1 && (
                   <select
-                    value={dbChapter.id}
+                    value={dbChapter.versionId}
                     onChange={(e) => setSelectedVersionId(e.target.value)}
                     className="bg-transparent border-none text-[11px] font-bold text-gray-600 focus:ring-0 cursor-pointer pr-6 py-1"
                   >
                     {dbChaptersForActive.map((v, idx) => (
-                      <option key={v.id} value={v.id}>
-                        Version {dbChaptersForActive.length - idx} ({new Date(v.createdAt?.seconds * 1000).toLocaleDateString()})
+                      <option key={v.versionId} value={v.versionId}>
+                        Version {dbChaptersForActive.length - idx} ({new Date(v.createdAtMs || Date.now()).toLocaleDateString()})
                       </option>
                     ))}
                   </select>
@@ -1738,7 +1612,7 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                     <InteractiveChapter 
                       code={activeChapterData.componentCode} 
                       annotations={annotations}
-                      activeChapterId={activeChapterData.id}
+                      activeChapterId={activeChapterId as string}
                       activeAnnotationId={activeAnnotationId}
                       onHighlightClick={(id, text, note) => {
                         setRightPane("notes");
@@ -1884,7 +1758,7 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                       );
                     } else {
                       let displayContent = block.content || "";
-                      const chapterAnnos = annotations.filter(a => a.chapterId === activeChapterData.id && a.blockIdx === idx);
+                      const chapterAnnos = annotations.filter(a => a.chapterId === activeChapterId && a.blockIdx === idx);
                       chapterAnnos.forEach(anno => {
                           if (anno.text && displayContent.includes(anno.text) && !displayContent.includes(`](#anno-${anno.id})`)) {
                               displayContent = displayContent.replace(anno.text, `[${anno.text}](#anno-${anno.id})`);
@@ -2159,6 +2033,11 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                 <p className="text-rose-500 font-medium">
                   Failed to generate this chapter.
                 </p>
+                {activeChapterRef?.errorMessage && (
+                  <p className="text-sm text-gray-500 max-w-md">
+                    {activeChapterRef.errorMessage}
+                  </p>
+                )}
                 <button
                   onClick={() => generateChapter(activeChapterId as string)}
                   className="text-indigo-600 font-bold hover:underline"
@@ -2166,7 +2045,12 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                   Try Again
                 </button>
               </div>
-            ) : (chaptersLoaded && activeChapterId && course?.outline) ? (
+            ) : dbChapter ? (
+              <div className="flex items-center justify-center h-full text-gray-400 flex-col gap-4">
+                <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
+                <p className="text-sm font-medium">Loading chapter content...</p>
+              </div>
+            ) : (activeChapterId && course?.outline) ? (
               <div className="flex-1 overflow-y-auto custom-scrollbar">
                 <div className="max-w-2xl mx-auto p-8 pt-12">
                   <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">

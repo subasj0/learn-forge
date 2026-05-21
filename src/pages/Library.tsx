@@ -10,7 +10,7 @@ import { ModuleCard } from '../components/ModuleCard';
 interface Course {
   id: string;
   title: string;
-  status: 'draft_outline' | 'review_outline' | 'generating_chapters' | 'ready' | 'failed' | 'processing';
+  status: 'generating_outline' | 'ready' | 'failed';
   errorMessage?: string;
   createdAt: any;
   isPublic?: boolean;
@@ -108,10 +108,8 @@ export default function Library() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
               {courses.map((course) => {
                 const isDeleting = deletingId === course.id;
-                const linkTo = course.status === 'ready' || course.status === 'generating_chapters' 
+                const linkTo = course.status === 'ready' || course.status === 'generating_outline' 
                   ? `/book/${course.id}` 
-                  : course.status === 'draft_outline' || course.status === 'review_outline'
-                  ? `/create-course/${course.id}`
                   : '#';
 
                 return (
@@ -192,14 +190,11 @@ export default function Library() {
 
 function StatusBadge({ status }: { status: string }) {
 
-  if (status === 'processing' || status === 'generating_chapters') {
+  if (status === 'generating_outline') {
     return <span className="px-2 py-1 bg-blue-50 text-blue-700 text-[10px] font-bold uppercase rounded border border-blue-100">Processing</span>;
   }
   if (status === 'failed') {
     return <span className="px-2 py-1 bg-red-50 text-red-700 text-[10px] font-bold uppercase rounded border border-red-100">Failed</span>;
-  }
-  if (status === 'draft_outline' || status === 'review_outline') {
-    return <span className="px-2 py-1 bg-amber-50 text-amber-700 text-[10px] font-bold uppercase rounded border border-amber-100">Outline Phase</span>;
   }
   return <span className="px-2 py-1 bg-green-50 text-green-700 text-[10px] font-bold uppercase rounded border border-green-100">Ready</span>;
 }

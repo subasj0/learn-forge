@@ -15,8 +15,8 @@ import {
   Timestamp,
   getDocs
 } from 'firebase/firestore';
-import { chatWithChapterStream, generateChatTitle } from '../lib/agents/courseGenerator';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { completeChat, createChatTitle } from '../lib/api';
 
 export type ChatRole = 'user' | 'model';
 
@@ -172,9 +172,12 @@ export function useAIChat(courseId: string | undefined, chapterId: string | null
       setStreamingMessageId(modelMsgId);
       setStreamingMessageText('');
       
-      const resText = await chatWithChapterStream(chapterTextContext, text, history, (chunkText) => {
-        setStreamingMessageText(chunkText);
+      const { text: resText } = await completeChat({
+        chapterText: chapterTextContext,
+        message: text,
+        history,
       });
+      setStreamingMessageText(resText);
       
       // Add model message
       await addDoc(messagesRef, {
@@ -188,7 +191,7 @@ export function useAIChat(courseId: string | undefined, chapterId: string | null
 
       // Auto title if first message
       if (!activeSession?.messages || activeSession.messages.length <= 1) {
-        generateChatTitle(text).then(title => {
+        createChatTitle(text).then(({ title }) => {
           updateDoc(sessionRef, { title });
         });
       }

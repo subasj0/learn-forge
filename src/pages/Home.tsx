@@ -3,12 +3,13 @@ import { useNavigate, Link } from 'react-router';
 import localforage from 'localforage';
 import { useAuth } from '../lib/auth';
 import { db } from '../lib/firebase';
-import { collection, doc, setDoc, serverTimestamp, query, where, onSnapshot, orderBy, limit } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, limit } from 'firebase/firestore';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 import { Plus, X, ArrowUp, Zap, BookOpen, Layers, CheckSquare, ChevronDown, FileText, Globe, LayoutTemplate, Sparkles } from 'lucide-react';
 import { motion } from 'motion/react';
 import { ModuleCard } from '../components/ModuleCard';
 import { CreatorBox, ExtractedFile } from '../components/CreatorBox';
+import { createModule } from '../lib/api';
 
 export interface FileData {
   text?: string;
@@ -29,7 +30,7 @@ interface PublicCourse {
   topic?: string;
   authorName?: string;
   coverImageUrl?: string;
-  status: 'draft_outline' | 'review_outline' | 'generating_chapters' | 'ready' | 'failed' | 'processing';
+  status: 'generating_outline' | 'ready' | 'failed';
   createdAt: any;
 }
 
@@ -67,27 +68,16 @@ export default function Home() {
           setLoading(true);
           const { content: savedContent, fileDataList, moduleType: savedModuleType } = pendingData;
           
-          const displayTitle = 'Generating course...';
-          const coursesRef = collection(db, 'courses');
-          const newCourseRef = doc(coursesRef);
-          const courseId = newCourseRef.id;
-
           const personalization = JSON.parse(localStorage.getItem('currentPersonalization') || '{}');
-          await setDoc(newCourseRef, {
-            userId: user.uid,
-            authorName: user.displayName || user.email?.split('@')[0] || 'Anonymous',
-            title: displayTitle,
+          const result = await createModule({
             topic: savedContent || 'Generated Course',
             moduleType: savedModuleType || 'guided',
             personalization: personalization,
-            status: 'draft_outline',
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
+            files: fileDataList || [],
           });
-
-          await localforage.setItem(`course_files_${courseId}`, fileDataList);
+          await localforage.setItem(`course_files_${result.courseId}`, fileDataList || []);
           
-          navigate(`/book/${courseId}`);
+          navigate(`/book/${result.courseId}`);
         } catch (error) {
           console.error("Error processing pending generation", error);
           setLoading(false);
@@ -155,28 +145,16 @@ export default function Home() {
     
     try {
       const fileDataList = files.filter(f => f.status === 'done').map(f => ({ text: f.text, name: f.name }));
-      const displayTitle = 'Generating course...';
-      
-      const coursesRef = collection(db, 'courses');
-      const newCourseRef = doc(coursesRef);
-      const courseId = newCourseRef.id;
-
       const personalization = JSON.parse(localStorage.getItem('currentPersonalization') || '{}');
-      await setDoc(newCourseRef, {
-        userId: user.uid,
-        authorName: user.displayName || user.email?.split('@')[0] || 'Anonymous',
-        title: displayTitle,
+      const result = await createModule({
         topic: content,
         moduleType: moduleType,
         personalization: personalization,
-        status: 'draft_outline',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
+        files: fileDataList,
       });
+      await localforage.setItem(`course_files_${result.courseId}`, fileDataList);
 
-      await localforage.setItem(`course_files_${courseId}`, fileDataList);
-
-      navigate(`/book/${courseId}`);
+      navigate(`/book/${result.courseId}`);
     } catch (error) {
       console.error("Error creating module", error);
       alert("Failed to submit. Please try again.");

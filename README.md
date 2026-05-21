@@ -18,3 +18,5 @@ View your app in AI Studio: https://ai.studio/apps/e5e9f19e-5e75-45d1-a88f-2fe10
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+If chapter generation fails with `The specified bucket does not exist`, create or verify the Firebase Storage bucket for this project in Firebase Console under Databases & Storage > Storage. The server writes generated chapter JSON to the bucket named in `firebase-applet-config.json`, and that bucket must already exist.

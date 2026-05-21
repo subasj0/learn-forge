@@ -1,9 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import { GoogleGenAI } from '@google/genai';
 import { auth } from '../firebase';
-import { checkBudget, recordUsage, BudgetExceededError } from './usageTracker';
-
-const ai = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY });
+import { checkBudget, recordUsage } from './usageTracker';
 
 
 // Use a public CDN for the worker to avoid Vite configuration issues
@@ -102,21 +99,22 @@ export async function extractTextFromFile(file: File): Promise<string> {
       reader.readAsDataURL(file);
     });
 
-    const parts = [
-      { text: "Extract all text from this image exactly as it appears. Return ONLY the raw extracted text, nothing else." },
-      { inlineData: { data: base64Data, mimeType: file.type || 'image/jpeg' } }
-    ];
-    
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-pro-preview",
-      contents: { parts }
+    const token = await auth.currentUser?.getIdToken();
+    const response = await fetch('/api/ocr-image', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ data: base64Data, mimeType: file.type || 'image/jpeg' }),
     });
-    
-    if (userId && response.usageMetadata) {
-      await recordUsage(userId, 'gemini-3.1-pro-preview', response.usageMetadata.promptTokenCount, response.usageMetadata.candidatesTokenCount);
+
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(result.error || `Image OCR failed with ${response.status}`);
     }
 
-    return response.text || "";
+    return result.text || "";
   }
 
   throw new Error(`Unsupported file type: ${fileType}. Please use PDF, Images, or Text files.`);
