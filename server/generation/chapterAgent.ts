@@ -1,8 +1,8 @@
 import { randomUUID } from 'crypto';
-import { GoogleGenAI, Type, type Schema } from '@google/genai';
 import { jsonrepair } from 'jsonrepair';
 import { buildStandardChapterPrompt } from './prompts/standardChapterPrompt';
 import { buildInteractiveChapterPrompt } from './prompts/interactiveChapterPrompt';
+import { generateOpenAIJson, generateOpenAIText } from './openai';
 import { writeChapterJson } from './chapterStorage';
 import {
   appendChapterVersion,
@@ -14,22 +14,20 @@ import {
 } from './moduleRepository';
 import type { GenerationConfig, SourceFile } from './types';
 
-function getAi() {
-  return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
-}
-
-const chapterSchema: Schema = {
-  type: Type.OBJECT,
+const chapterSchema = {
+  type: 'object',
+  additionalProperties: false,
   properties: {
     mainContent: {
-      type: Type.ARRAY,
+      type: 'array',
       items: {
-        type: Type.OBJECT,
+        type: 'object',
+        additionalProperties: false,
         properties: {
-          type: { type: Type.STRING },
-          content: { type: Type.STRING },
-          title: { type: Type.STRING },
-          calloutType: { type: Type.STRING },
+          type: { type: 'string' },
+          content: { type: 'string' },
+          title: { type: 'string' },
+          calloutType: { type: 'string' },
         },
         required: ['type', 'content'],
       },
@@ -74,34 +72,34 @@ export async function generateChapterVersion(args: {
     const moduleType = course.moduleType || 'guided';
 
     if (moduleType === 'interactive') {
-      const responseStream = await getAi().models.generateContentStream({
-        model: 'gemini-3-flash-preview',
-        contents: {
-          parts: [{
-            text: buildInteractiveChapterPrompt({
+      const fullCode = await generateOpenAIText({
+        input: [
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: buildInteractiveChapterPrompt({
               courseContext: course.topic,
               partTitle: located.part.title,
               chapter: located.chapter,
               personalization: course.personalization,
               generationConfig,
               files: args.files,
-            }),
-          }],
-        },
-        config: { maxOutputTokens: 15000, temperature: 0.7 },
+            }) }],
+          },
+        ],
+        maxOutputTokens: 15000,
+        temperature: 0.7,
       });
-
-      let fullCode = '';
-      for await (const chunk of responseStream) {
-        if (chunk.text) fullCode += chunk.text;
+      const componentCode = extractCode(fullCode);
+      if (!componentCode) {
+        throw new Error('Generated interactive chapter code is empty');
       }
-      content = { componentCode: extractCode(fullCode), moduleType: 'interactive' };
+      content = { componentCode, moduleType: 'interactive' };
     } else {
-      const response = await getAi().models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: {
-          parts: [{
-            text: buildStandardChapterPrompt({
+      const responseText = await generateOpenAIJson({
+        input: [
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: buildStandardChapterPrompt({
               courseContext: course.topic,
               partTitle: located.part.title,
               chapter: located.chapter,
@@ -109,16 +107,17 @@ export async function generateChapterVersion(args: {
               personalization: course.personalization,
               generationConfig,
               files: args.files,
-            }),
-          }],
-        },
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: chapterSchema,
-          maxOutputTokens: 10000,
-        },
+            }) }],
+          },
+        ],
+        schema: chapterSchema,
+        schemaName: 'chapter_content',
+        maxOutputTokens: 10000,
       });
-      content = parseJson(response.text || '{}');
+      content = parseJson(responseText || '{}');
+      if (!Array.isArray(content.mainContent) || content.mainContent.length === 0) {
+        throw new Error('Generated chapter content is empty');
+      }
     }
 
     const versionId = `${Date.now()}-${randomUUID()}`;

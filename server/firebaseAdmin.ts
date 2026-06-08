@@ -25,6 +25,9 @@ const app = getApps()[0] || initializeApp({
   storageBucket: firebaseConfig.storageBucket,
 });
 
+const firestore = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+firestore.settings({ ignoreUndefinedProperties: true });
+
 export const adminAuth = getAuth(app);
-export const adminDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const adminDb = firestore;
 export const adminStorage = getStorage(app).bucket(firebaseConfig.storageBucket);

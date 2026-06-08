@@ -5,10 +5,7 @@ export const DAILY_BUDGET = 0.50; // $0.5
 export const MONTHLY_BUDGET = 1.00; // $1.00
 
 export const MODEL_PRICING = {
-  'gemini-3.1-pro-preview': { input: 1.25 / 1000000, output: 5.00 / 1000000 },
-  'gemini-3-flash-preview': { input: 0.075 / 1000000, output: 0.30 / 1000000 },
-  'gemini-2.5-flash': { input: 0.075 / 1000000, output: 0.30 / 1000000 },
-  'gemini-2.5-flash-image': { input: 0, output: 0.03 }, // flat $0.03 per image
+  'gpt-5.4-mini': { input: 0.075 / 1000000, output: 0.30 / 1000000 },
   'ocr-api': { input: 0, output: 0.01 }, // Flat $0.01 per OCR request
 };
 
@@ -47,7 +44,7 @@ export async function checkBudget(userId: string) {
 }
 
 export async function recordUsage(userId: string, model: keyof typeof MODEL_PRICING, inputTokens: number, outputTokens: number, isImage: boolean = false) {
-  const pricing = MODEL_PRICING[model] || MODEL_PRICING['gemini-3-flash-preview'];
+  const pricing = MODEL_PRICING[model] || MODEL_PRICING['gpt-5.4-mini'];
   let cost = 0;
   if (isImage) {
     cost = pricing.output; // single image cost

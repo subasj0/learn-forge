@@ -7,6 +7,7 @@ import { adminAuth } from './server/firebaseAdmin';
 import { createModuleOutline } from './server/generation/moduleAgent';
 import { generateChapterVersion } from './server/generation/chapterAgent';
 import { readChapterJson } from './server/generation/chapterStorage';
+import { extractImageText } from './server/generation/openai';
 import {
   createCourseShell,
   findChapterVersion,
@@ -147,18 +148,8 @@ async function startServer() {
         return res.status(400).json({ error: 'Missing image data' });
       }
 
-      const { GoogleGenAI } = await import('@google/genai');
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: {
-          parts: [
-            { text: 'Extract all text from this image exactly as it appears. Return ONLY the raw extracted text, nothing else.' },
-            { inlineData: { data, mimeType } },
-          ],
-        },
-      });
-      res.json({ text: response.text || '' });
+      const text = await extractImageText({ data, mimeType });
+      res.json({ text });
     } catch (error: any) {
       res.status(500).json({ error: error.message || 'Failed to extract image text' });
     }

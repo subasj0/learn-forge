@@ -87,7 +87,7 @@ export async function extractTextFromFile(file: File): Promise<string> {
     }
   }
 
-  // For images, use Gemini as the custom API handles PDFs
+  // For images, use the server-side OpenAI OCR route; the custom API handles PDFs.
   if (fileType.startsWith('image/')) {
     const base64Data = await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();

@@ -44,14 +44,11 @@ import { useAIChat } from "../../hooks/useAIChat";
 import { completeChat, fetchChapterContent, generateChapter as generateChapterApi } from "../../lib/api";
 import { Runner } from "react-runner";
 import * as LucideIcons from "lucide-react";
-import * as Motion from "motion/react";
-import * as Recharts from "recharts";
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
-
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
+import {
+  buildChapterRunnerScope,
+  hasChapterDefaultExport,
+  prepareChapterCode,
+} from "../../chapter-components/runnerScope";
 
 function getChapterRef(course: any, chapterId: string | null) {
   if (!course || !chapterId) return null;
@@ -112,35 +109,9 @@ const InteractiveChapter = React.memo(function InteractiveChapter({
 
   const containerRef = React.useRef<HTMLDivElement>(null);
 
-  // Extract code from block if wrapped in markdown
-  const cleanedCode = React.useMemo(() => {
-    const codeMatch = code.match(/```(?:typescript|tsx|javascript|jsx)?\n([\s\S]*?)(?:```|$)/);
-    if (codeMatch) {
-      return codeMatch[1].trim();
-    } else {
-      return code.replace(/```(?:typescript|tsx|javascript|jsx)?/g, "").replace(/```/g, "").trim();
-    }
-  }, [code]);
-
+  const strippedCode = React.useMemo(() => prepareChapterCode(code), [code]);
   const [runnerError, setRunnerError] = React.useState<string | null>(null);
-
-  // Strip imports as react-runner provides them via scope
-  const strippedCode = React.useMemo(() => {
-    return cleanedCode
-      .replace(/^import\s+[\s\S]*?from\s+['"].*?['"];?\s*$/gm, "")
-      .replace(/^import\s+['"].*?['"];?\s*$/gm, "");
-  }, [cleanedCode]);
-
-  const scope = React.useMemo(() => ({
-    React,
-    ...React,
-    ...LucideIcons,
-    ...Motion,
-    ...Recharts,
-    cn,
-    motion: Motion.motion,
-    AnimatePresence: Motion.AnimatePresence,
-  }), []);
+  const scope = React.useMemo(() => buildChapterRunnerScope(), []);
 
   React.useEffect(() => {
     if (!containerRef.current) return;
@@ -240,8 +211,7 @@ const InteractiveChapter = React.memo(function InteractiveChapter({
     return () => observer.disconnect();
   }, [code, annotations, activeChapterId, activeAnnotationId, onHighlightClick]);
 
-  // Basic check to see if we have enough code to potentially render
-  if (!cleanedCode.toLowerCase().includes("export default")) {
+  if (!hasChapterDefaultExport(code)) {
     return (
       <div className="flex flex-col items-center justify-center p-12 bg-gray-50 rounded-3xl border border-dashed border-gray-200">
         <Loader2 className="w-8 h-8 animate-spin text-indigo-500 mb-4" />
@@ -1600,30 +1570,30 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                </div>
              </div>
             ) : activeChapterData ? (
-              <div
-                className={`max-w-4xl mx-auto px-6 py-12 lg:px-12 lg:py-16 h-full ${fontFamily}`}
-              >
-                <h1 className="text-4xl lg:text-5xl font-bold text-gray-900 mb-10 leading-tight">
-                  {displayTitle}
-                </h1>
+              activeChapterData.moduleType === 'interactive' || activeChapterData.componentCode ? (
+                <div className="w-full">
+                  <InteractiveChapter 
+                    code={activeChapterData.componentCode} 
+                    annotations={annotations}
+                    activeChapterId={activeChapterId as string}
+                    activeAnnotationId={activeAnnotationId}
+                    onHighlightClick={(id, text, note) => {
+                      setRightPane("notes");
+                      setActiveAnnotationId(id);
+                      setSelectedHighlightText(text);
+                      setNoteInput(note);
+                      setShowNoteInput(true);
+                    }}
+                  />
+                </div>
+              ) : (
+                <div
+                  className={`max-w-4xl mx-auto px-6 py-12 lg:px-12 lg:py-16 h-full ${fontFamily}`}
+                >
+                  <h1 className="text-4xl lg:text-5xl font-bold text-gray-900 mb-10 leading-tight">
+                    {displayTitle}
+                  </h1>
 
-                {activeChapterData.moduleType === 'interactive' || activeChapterData.componentCode ? (
-                  <div className="w-full">
-                    <InteractiveChapter 
-                      code={activeChapterData.componentCode} 
-                      annotations={annotations}
-                      activeChapterId={activeChapterId as string}
-                      activeAnnotationId={activeAnnotationId}
-                      onHighlightClick={(id, text, note) => {
-                        setRightPane("notes");
-                        setActiveAnnotationId(id);
-                        setSelectedHighlightText(text);
-                        setNoteInput(note);
-                        setShowNoteInput(true);
-                      }}
-                    />
-                  </div>
-                ) : (
                   <div className="space-y-8">
                     {isEditMode && (
                     <div className="flex items-center justify-center -mt-6 mb-8 flex-col gap-4">
@@ -1977,7 +1947,6 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                     );
                   })}
                 </div>
-                )}
 
                 <div className="mt-20 pt-8 border-t border-gray-100 flex items-center justify-between">
                   <button
@@ -2019,6 +1988,7 @@ Output ONLY the text content in markdown format. No headers if not specifically 
                   </button>
                 </div>
               </div>
+            )
             ) : isGeneratingActive ? (
               <div className="flex items-center justify-center h-full text-indigo-600 p-8 flex-col gap-4 text-center">
                 <Loader2 className="w-8 h-8 animate-spin" />

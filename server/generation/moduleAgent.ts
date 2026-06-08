@@ -1,31 +1,30 @@
-import { GoogleGenAI, Type, type Schema } from '@google/genai';
 import { jsonrepair } from 'jsonrepair';
 import { buildOutlinePrompt } from './prompts/outlinePrompt';
+import { generateOpenAIJson } from './openai';
 import type { CourseOutline, SourceFile } from './types';
 
-function getAi() {
-  return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
-}
-
-const outlineSchema: Schema = {
-  type: Type.OBJECT,
+const outlineSchema = {
+  type: 'object',
+  additionalProperties: false,
   properties: {
-    title: { type: Type.STRING },
+    title: { type: 'string' },
     parts: {
-      type: Type.ARRAY,
+      type: 'array',
       items: {
-        type: Type.OBJECT,
+        type: 'object',
+        additionalProperties: false,
         properties: {
-          id: { type: Type.STRING },
-          title: { type: Type.STRING },
+          id: { type: 'string' },
+          title: { type: 'string' },
           chapters: {
-            type: Type.ARRAY,
+            type: 'array',
             items: {
-              type: Type.OBJECT,
+              type: 'object',
+              additionalProperties: false,
               properties: {
-                id: { type: Type.STRING },
-                title: { type: Type.STRING },
-                guidance: { type: Type.STRING },
+                id: { type: 'string' },
+                title: { type: 'string' },
+                guidance: { type: 'string' },
               },
               required: ['id', 'title', 'guidance'],
             },
@@ -58,17 +57,22 @@ export async function createModuleOutline(args: {
   personalization?: any;
   files?: SourceFile[];
 }): Promise<CourseOutline> {
-  const response = await getAi().models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: { parts: [{ text: buildOutlinePrompt(args.topic, args.moduleType, args.personalization, args.files) }] },
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: outlineSchema,
-      maxOutputTokens: 10000,
-    },
+  const responseText = await generateOpenAIJson({
+    input: [
+      {
+        role: 'user',
+        content: [{ type: 'input_text', text: buildOutlinePrompt(args.topic, args.moduleType, args.personalization, args.files) }],
+      },
+    ],
+    schema: outlineSchema,
+    schemaName: 'course_outline',
+    maxOutputTokens: 10000,
   });
 
-  const outline = parseJson(response.text || '{}');
+  const outline = parseJson(responseText || '{}');
+  outline.title = typeof outline.title === 'string' && outline.title.trim()
+    ? outline.title.trim()
+    : `${args.topic?.trim() || 'Generated Course'}`;
   const seen = new Set<string>();
   outline.parts = (outline.parts || []).map((part: any, pIdx: number) => ({
     ...part,
@@ -84,6 +88,10 @@ export async function createModuleOutline(args: {
       return { ...chapter, id };
     }),
   }));
+
+  if (!Array.isArray(outline.parts) || outline.parts.length === 0) {
+    throw new Error('Generated outline is empty');
+  }
 
   return outline;
 }

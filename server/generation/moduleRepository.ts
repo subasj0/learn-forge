@@ -44,7 +44,7 @@ export async function markCourseOutlineReady(courseId: string, outline: CourseOu
   }
 
   await courseRef(courseId).update({
-    title: outline.title,
+    title: typeof outline.title === 'string' && outline.title.trim() ? outline.title.trim() : 'Generated Course',
     outline: outline.parts,
     chapterRefs,
     status: 'ready',

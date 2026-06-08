@@ -1,8 +1,8 @@
 import { readFileSync } from 'fs';
 import path from 'path';
+import { CHAPTER_COMPONENT_NAMES } from '../../../src/chapter-components/contracts';
 import type { CourseOutlineChapter, GenerationConfig, SourceFile } from '../types';
 
-const MAX_SKILL_CONTEXT_CHARS = 1200;
 const MAX_ATTACHED_FILE_CHARS = 12000;
 const MAX_ATTACHED_CONTEXT_CHARS = 30000;
 
@@ -18,16 +18,6 @@ function readOptional(relativePath: string) {
   }
 }
 
-function getSkillsContext() {
-  const files = [
-    'src/lib/agents/skills/motion_animations.md',
-    'src/lib/agents/skills/quizzes_and_logic.md',
-    'src/lib/agents/skills/recharts_data_viz.md',
-    'src/lib/agents/skills/svg_diagrams.md',
-  ];
-  return files.map((file) => `--- Skill: ${path.basename(file)} ---\n${trimText(readOptional(file), MAX_SKILL_CONTEXT_CHARS)}`).join('\n\n');
-}
-
 export function buildInteractiveChapterPrompt(args: {
   courseContext: string;
   partTitle: string;
@@ -37,15 +27,7 @@ export function buildInteractiveChapterPrompt(args: {
   files?: SourceFile[];
 }) {
   const { courseContext, partTitle, chapter, personalization = {}, generationConfig = {}, files = [] } = args;
-  const courseLower = `${courseContext} ${chapter.title}`.toLowerCase();
-  const recommendedTheme = courseLower.includes('tech') || courseLower.includes('coding') || courseLower.includes('quantum') || courseLower.includes('space')
-    ? 'Tech/Sci-Fi'
-    : courseLower.includes('bio') || courseLower.includes('botany') || courseLower.includes('nature') || courseLower.includes('garden')
-      ? 'Nature/Organic'
-      : 'Deep Academic';
-
   const guidelines = readOptional('src/lib/agents/prompts/interactive_course_guidelines.md');
-  const skillsContext = getSkillsContext();
   let attachedChars = 0;
   const fileContext = files
     .filter((file) => file.text && attachedChars < MAX_ATTACHED_CONTEXT_CHARS)
@@ -56,8 +38,7 @@ export function buildInteractiveChapterPrompt(args: {
     })
     .join('\n');
 
-  const styleGuide = [
-    `Theme Recommendation: Use the ${recommendedTheme} style.`,
+  const contentGuide = [
     `Target Audience: ${generationConfig.depth || personalization.depth || personalization.complexity || 'Intermediate'}`,
     `Tone: ${generationConfig.tone || personalization.tone || 'Balanced'}`,
     generationConfig.focus ? `Specific Focus: ${generationConfig.focus}` : '',
@@ -65,36 +46,40 @@ export function buildInteractiveChapterPrompt(args: {
     personalization.interests ? `Personalized Context: Integrate examples related to ${personalization.interests}.` : '',
   ].filter(Boolean).join('\n- ');
 
+  const chapterObjectives = generationConfig.guidance || chapter.guidance || 'Teach the chapter topic clearly with one strong model and one applied example.';
+  const injectedComponents = CHAPTER_COMPONENT_NAMES.join(', ');
+
   return `You are a world-class React developer and educational designer.
-Generate a single-file React component (TypeScript) that represents an interactive, premium educational chapter.
+Generate a single default-exported React component for an interactive educational chapter.
 
 Core Directive:
-Create a "Modern Academic" experience. The chapter must feel like a high-end digital publication.
+Create a calm, structured, premium learning chapter by composing the predefined Learn Forge chapter components. Do not invent a separate design system, card library, or color palette.
 
-Technical Constraints:
+Mandatory Rules:
+- Output ONLY the raw component code. No markdown fences.
 - Default export ONLY.
-- Tailwind CSS ONLY for styling.
-- Lucide-react for icons.
-- motion/react for animations.
-- recharts for charts.
-- The cn function is GLOBAL. Do not define or import it.
-- NO external imports other than: react, lucide-react, motion/react, recharts.
+- Do not include imports. React hooks, lucide icons, motion, recharts, cn, chapterTheme, and these injected chapter components are already in scope: ${injectedComponents}.
+- Accept \`{ theme = chapterTheme }\` and pass \`theme={theme}\` to every predefined chapter component.
+- Use \`ChapterHero\` for the hero block.
+- Use numbered \`Section\` blocks for the main chapter flow.
+- Use \`ProcessFlow\`, \`Timeline\`, \`DataTable\`, or a simple chart for the core model.
+- Use \`Quizz\` for quiz interactions instead of building a custom quiz UI.
+- Route all color styling through \`theme\` tokens. Do not use raw Tailwind color classes.
+- Keep interactivity to 1-2 blocks with labeled controls and visible feedback.
+- Make the chapter specific to the topic. No placeholders, TODOs, or developer notes.
 
-Current Topic Context:
+Chapter Context:
 - Course: ${courseContext}
 - Part: ${partTitle}
 - Chapter: ${chapter.title}
-- Objectives: ${generationConfig.guidance || chapter.guidance || ''}
+- Objectives: ${chapterObjectives}
 
-Personalization:
-- ${styleGuide}
+Content Personalization:
+- ${contentGuide}
 
 Applied Guidelines:
-${guidelines}
+${guidelines || 'Follow the Learn Forge interactive chapter component contract.'}
 
-${skillsContext}
-
-Output ONLY the raw component code in a typescript block. Ensure the component is robust and does not crash.
+Output ONLY the raw component code. Ensure the component is robust, complete, and does not crash when rendered with no props.
 ${fileContext}`;
 }
-
